@@ -16,6 +16,8 @@ from ida_mcp.uploads import (
     get_upload_max_bytes,
     get_upload_store,
     leased_database_paths,
+    public_base_from_request,
+    request_public_base_scope,
     sanitize_filename,
 )
 
@@ -233,7 +235,28 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         self.send_cors_headers(preflight=True)
         self.end_headers()
 
+    def _forwarded_headers(self) -> dict[str, str]:
+        names = (
+            "Host",
+            "Forwarded",
+            "X-Forwarded-Host",
+            "X-Forwarded-Proto",
+            "X-Forwarded-Prefix",
+        )
+        return {name: self.headers.get(name, "") or "" for name in names}
+
+    def _request_public_base(self) -> str | None:
+        return public_base_from_request(
+            self._forwarded_headers(),
+            request_path=urlparse(self.path).path,
+            path_prefix=self.mcp_server.path_prefix,
+        )
+
     def do_GET(self) -> None:
+        with request_public_base_scope(self._request_public_base()):
+            self._do_GET()
+
+    def _do_GET(self) -> None:
         route = self._uploads_route()
         if route == ("collection", None):
             if not self._check_api_request():
@@ -250,6 +273,10 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         super().do_GET()
 
     def do_POST(self) -> None:
+        with request_public_base_scope(self._request_public_base()):
+            self._do_POST()
+
+    def _do_POST(self) -> None:
         if self._uploads_route() == ("collection", None):
             if not self._check_api_request():
                 return
@@ -265,6 +292,10 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         super().do_POST()
 
     def do_DELETE(self) -> None:
+        with request_public_base_scope(self._request_public_base()):
+            self._do_DELETE()
+
+    def _do_DELETE(self) -> None:
         route = self._uploads_route()
         if route is not None and route[0] == "item":
             if not self._check_api_request():

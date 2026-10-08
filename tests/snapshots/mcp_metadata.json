@@ -334,7 +334,7 @@
       },
       {
         "name": "upload_info",
-        "description": "Return the HTTP URL and curl examples for uploading a sample.\n\nRecommended flow: upload_info -> POST the file to url (curl or HTTP client)\n-> confirm_upload(upload_id) -> open_database(path). Do not send file bytes\nthrough MCP tools. This tool does not call open_database and never returns\nthe bearer token.",
+        "description": "Return the absolute HTTP URL for uploading a sample.\n\nAgents and curl do not have browser same-origin. url is built from this\nMCP request (Host, X-Forwarded-Proto, X-Forwarded-Host, Forwarded) or\nIDA_MCP_PUBLIC_URL behind a proxy. Recommended flow: upload_info -> POST\nurl -> confirm_upload(upload_id) -> open_database(path). Do not send file\nbytes through MCP. Never returns the bearer token. Local stdio agents\nshould pass a filesystem path on this machine to open_database instead.",
         "inputSchema": {
           "type": "object",
           "properties": {},
@@ -359,6 +359,9 @@
                   "type": "null"
                 }
               ]
+            },
+            "path": {
+              "type": "string"
             },
             "method": {
               "type": "string"
@@ -385,6 +388,7 @@
           "required": [
             "available",
             "url",
+            "path",
             "method",
             "auth_required",
             "max_bytes",

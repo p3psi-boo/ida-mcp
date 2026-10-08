@@ -531,7 +531,7 @@ def serve_http(
 
     previous_manager.shutdown()
     _HTTP_SERVER_STARTED = True
-    set_http_bind(host, port)
+    set_http_bind(host, port, mcp.path_prefix)
     _start_mcp_trace(
         f"http://{host}:{port}{mcp.path_prefix}/mcp",
         agent,
@@ -1008,12 +1008,14 @@ def close_database(
 
 @tool(title="Show sample upload HTTP API", read_only=True)
 def upload_info() -> UploadInfoResult:
-    """Return the HTTP URL and curl examples for uploading a sample.
+    """Return the absolute HTTP URL for uploading a sample.
 
-    Recommended flow: upload_info -> POST the file to url (curl or HTTP client)
-    -> confirm_upload(upload_id) -> open_database(path). Do not send file bytes
-    through MCP tools. This tool does not call open_database and never returns
-    the bearer token.
+    Agents and curl do not have browser same-origin. url is built from this
+    MCP request (Host, X-Forwarded-Proto, X-Forwarded-Host, Forwarded) or
+    IDA_MCP_PUBLIC_URL behind a proxy. Recommended flow: upload_info -> POST
+    url -> confirm_upload(upload_id) -> open_database(path). Do not send file
+    bytes through MCP. Never returns the bearer token. Local stdio agents
+    should pass a filesystem path on this machine to open_database instead.
     """
 
     return http_upload_info()

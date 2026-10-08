@@ -14,10 +14,12 @@ import posixpath
 import re
 import threading
 import uuid
-from collections.abc import Iterable
-from contextlib import suppress
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from pathlib import Path
 from typing import TypedDict
+from urllib.parse import urlparse
 
 from ida_mcp.paths import get_mcp_inbox_dir
 
@@ -83,6 +85,7 @@ class DeleteUploadResult(TypedDict):
 class UploadInfoResult(TypedDict):
     available: bool
     url: str | None
+    path: str
     method: str
     auth_required: bool
     max_bytes: int
@@ -92,8 +95,13 @@ class UploadInfoResult(TypedDict):
     hint: str
 
 
-_HTTP_BIND: tuple[str, int] | None = None
+_HTTP_BIND: tuple[str, int, str] | None = None
 _BIND_LOCK = threading.Lock()
+_REQUEST_PUBLIC_BASE: ContextVar[str | None] = ContextVar(
+    "ida_mcp_request_public_base",
+    default=None,
+)
+_WILDCARD_BIND_HOSTS = {"0.0.0.0", "::", "*", ""}
 
 
 def get_mcp_token() -> str | None:
@@ -535,10 +543,10 @@ def _remove_tree(path: Path) -> None:
     path.unlink()
 
 
-def set_http_bind(host: str, port: int) -> None:
+def set_http_bind(host: str, port: int, path_prefix: str = "") -> None:
     global _HTTP_BIND
     with _BIND_LOCK:
-        _HTTP_BIND = (host, port)
+        _HTTP_BIND = (host, port, path_prefix)
 
 
 def clear_http_bind() -> None:
@@ -547,16 +555,133 @@ def clear_http_bind() -> None:
         _HTTP_BIND = None
 
 
-def _public_origin(host: str, port: int) -> str:
-    override = os.environ.get(PUBLIC_URL_ENVIRONMENT_VARIABLE)
-    if override and override.strip():
-        return override.strip().rstrip("/")
+@contextmanager
+def request_public_base_scope(base: str | None) -> Iterator[None]:
+    token = _REQUEST_PUBLIC_BASE.set(base)
+    try:
+        yield
+    finally:
+        _REQUEST_PUBLIC_BASE.reset(token)
+
+
+def _first_header_value(value: str | None) -> str:
+    if not value:
+        return ""
+    return value.split(",", 1)[0].strip().strip('"')
+
+
+def _header_host(value: str) -> str:
+    """Return a Host-like value, or empty if it cannot be put in a URL."""
+    host = value.strip()
+    if not host or any(char in host for char in "/\\ \t\r\n"):
+        return ""
+    return host
+
+
+def _parse_forwarded(value: str | None) -> tuple[str, str]:
+    """Return (proto, host) from the first RFC 7239 Forwarded element."""
+    if not value:
+        return "", ""
+    proto = host = ""
+    first = value.split(",", 1)[0]
+    for part in first.split(";"):
+        name, _, raw = part.partition("=")
+        name = name.strip().lower()
+        raw = raw.strip().strip('"')
+        if name == "proto":
+            proto = raw
+        elif name == "host":
+            host = raw
+    return proto, host
+
+
+def public_base_from_request(
+    headers: Mapping[str, str],
+    *,
+    request_path: str,
+    path_prefix: str = "",
+) -> str | None:
+    """Build the caller-facing origin from this HTTP request.
+
+    Agents and curl have no browser same-origin. After a reverse proxy the
+    listen address is usually unreachable, so the URL must come from Host /
+    Forwarded headers (or IDA_MCP_PUBLIC_URL).
+    """
+    forwarded_proto, forwarded_host = _parse_forwarded(headers.get("Forwarded"))
+    host = _header_host(
+        _first_header_value(headers.get("X-Forwarded-Host"))
+        or forwarded_host
+        or (headers.get("Host") or "")
+    )
+    proto = (
+        _first_header_value(headers.get("X-Forwarded-Proto"))
+        or forwarded_proto
+        or "http"
+    ).lower()
+    if proto not in {"http", "https"}:
+        proto = "http"
+    if not host:
+        return None
+    prefix = _first_header_value(headers.get("X-Forwarded-Prefix")).rstrip("/")
+    if not prefix and path_prefix and request_path.startswith(f"{path_prefix}/"):
+        prefix = path_prefix
+    if prefix and not prefix.startswith("/"):
+        prefix = f"/{prefix}"
+    return f"{proto}://{host}{prefix}"
+
+
+def _bind_is_wildcard(host: str) -> bool:
+    value = host.strip()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    return value in _WILDCARD_BIND_HOSTS
+
+
+def _format_bind_origin(host: str, port: int, path_prefix: str) -> str | None:
+    if _bind_is_wildcard(host):
+        return None
     value = host.strip()
     if value.startswith("[") and value.endswith("]"):
         value = value[1:-1]
     if ":" in value:
         value = f"[{value}]"
-    return f"http://{value}:{port}"
+    prefix = path_prefix.rstrip("/")
+    return f"http://{value}:{port}{prefix}"
+
+
+def _configured_public_origin() -> str | None:
+    override = os.environ.get(PUBLIC_URL_ENVIRONMENT_VARIABLE)
+    if override is None or not override.strip():
+        return None
+    value = override.strip().rstrip("/")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return value
+
+
+def _uploads_http_path(origin: str | None) -> str:
+    if origin:
+        prefix = urlparse(origin).path.rstrip("/")
+        return f"{prefix}/uploads" if prefix else "/uploads"
+    with _BIND_LOCK:
+        bind = _HTTP_BIND
+    prefix = (bind[2] if bind else "").rstrip("/")
+    return f"{prefix}/uploads" if prefix else "/uploads"
+
+
+def _upload_public_origin() -> str | None:
+    configured = _configured_public_origin()
+    if configured is not None:
+        return configured
+    request_base = _REQUEST_PUBLIC_BASE.get()
+    if request_base:
+        return request_base.rstrip("/")
+    with _BIND_LOCK:
+        bind = _HTTP_BIND
+    if bind is None:
+        return None
+    return _format_bind_origin(*bind)
 
 
 def http_upload_info() -> UploadInfoResult:
@@ -569,6 +694,7 @@ def http_upload_info() -> UploadInfoResult:
         return UploadInfoResult(
             available=False,
             url=None,
+            path="",
             method="POST",
             auth_required=auth_required,
             max_bytes=max_bytes,
@@ -576,35 +702,47 @@ def http_upload_info() -> UploadInfoResult:
             filename_header="X-Filename",
             curl="",
             hint=(
-                "HTTP upload is available only when this process was started with "
-                "ida-mcp http. Call upload_info again on the HTTP server, POST the "
-                "sample to /uploads, then confirm_upload(upload_id) and "
-                "open_database(path). Do not send file bytes through MCP tools."
+                "This process is not serving HTTP. A local stdio agent can pass a "
+                "filesystem path on this machine to open_database. Remote agents "
+                "should connect to ida-mcp http; POST /uploads is advertised as an "
+                "absolute URL from that request's Host / X-Forwarded-* headers."
             ),
         )
-    url = f"{_public_origin(*bind)}/uploads"
+    origin = _upload_public_origin()
+    path = _uploads_http_path(origin)
+    if origin:
+        parsed = urlparse(origin)
+        url = f"{parsed.scheme}://{parsed.netloc}{path}"
+    else:
+        url = None
+    target = url or f"$MCP_ORIGIN{path}"
     auth = ' -H "Authorization: Bearer $IDA_MCP_TOKEN"' if auth_required else ""
     curl = (
-        f'curl -fsS{auth} -F "file=@sample.bin" {url}\n'
+        f'curl -fsS{auth} -F "file=@sample.bin" {target}\n'
         f'curl -fsS{auth} -H "X-Filename: sample.bin" '
-        f"--data-binary @sample.bin {url}"
+        f"--data-binary @sample.bin {target}"
+    )
+    hint = (
+        "POST the sample to url. Agents and curl are not browsers and have no "
+        "same-origin, so they cannot infer /uploads from the /mcp URL. After a "
+        "reverse proxy the listen address is also wrong. url is therefore an "
+        "absolute URL: IDA_MCP_PUBLIC_URL if set, otherwise Host / "
+        "X-Forwarded-Proto / X-Forwarded-Host / Forwarded from this MCP request. "
+        "If url is null, POST to path on the same origin you used for /mcp. Then "
+        "confirm_upload(upload_id) and open_database(path). This tool does not "
+        "call open_database and never returns the bearer token."
     )
     return UploadInfoResult(
         available=True,
         url=url,
+        path=path,
         method="POST",
         auth_required=auth_required,
         max_bytes=max_bytes,
         multipart_field="file",
         filename_header="X-Filename",
         curl=curl,
-        hint=(
-            "POST the sample to url with curl or an HTTP client. Use the JSON "
-            "upload_id in confirm_upload, then pass the returned path to "
-            "open_database. Do not send file bytes through MCP. If auth_required "
-            "is true, send Authorization: Bearer <token>; this result never "
-            "includes the token."
-        ),
+        hint=hint,
     )
 
 

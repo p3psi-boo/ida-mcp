@@ -29,6 +29,7 @@ def inbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.setenv("IDA_MCP_INBOX", str(path))
     monkeypatch.delenv(uploads_api.TOKEN_ENVIRONMENT_VARIABLE, raising=False)
     monkeypatch.delenv(uploads_api.UPLOAD_MAX_BYTES_ENVIRONMENT_VARIABLE, raising=False)
+    monkeypatch.delenv(uploads_api.PUBLIC_URL_ENVIRONMENT_VARIABLE, raising=False)
     uploads_api.reset_upload_store()
     monkeypatch.setattr(
         mcp_api,
@@ -182,6 +183,7 @@ def test_upload_info_is_unavailable_without_http(inbox: Path) -> None:
     info = mcp_api.upload_info()
     assert info["available"] is False
     assert info["url"] is None
+    assert info["path"] == ""
     assert "ida-mcp http" in info["hint"]
     assert "secret" not in json.dumps(info)
 
@@ -198,6 +200,7 @@ def test_http_upload_then_confirm_is_usable_by_open_database(
         info = mcp_api.upload_info()
         assert info["available"] is True
         assert info["url"] == f"http://127.0.0.1:{port}/uploads"
+        assert info["path"] == "/uploads"
         assert info["method"] == "POST"
         assert info["auth_required"] is False
         assert "Bearer" not in info["curl"]
@@ -468,3 +471,186 @@ def test_uuid_directory_layout(inbox: Path) -> None:
     assert path.parent.name == begun["upload_id"]
     assert path.parent.parent == inbox.resolve()
     assert path.name == "name.bin"
+
+
+def test_public_base_from_request_uses_forwarded_headers() -> None:
+    assert (
+        uploads_api.public_base_from_request(
+            {
+                "Host": "127.0.0.1:8737",
+                "X-Forwarded-Proto": "https",
+                "X-Forwarded-Host": "ida.example.com",
+            },
+            request_path="/mcp",
+        )
+        == "https://ida.example.com"
+    )
+    assert (
+        uploads_api.public_base_from_request(
+            {
+                "Host": "127.0.0.1:8737",
+                "Forwarded": 'for=10.0.0.1;proto=https;host="ida.example.com"',
+            },
+            request_path="/mcp",
+        )
+        == "https://ida.example.com"
+    )
+    assert (
+        uploads_api.public_base_from_request(
+            {
+                "Host": "127.0.0.1:8737",
+                "X-Forwarded-Proto": "https",
+                "X-Forwarded-Host": "ida.example.com",
+                "X-Forwarded-Prefix": "/hex-rays",
+            },
+            request_path="/mcp",
+        )
+        == "https://ida.example.com/hex-rays"
+    )
+    assert (
+        uploads_api.public_base_from_request(
+            {"Host": "127.0.0.1:8737"},
+            request_path="/hex-rays/mcp",
+            path_prefix="/hex-rays",
+        )
+        == "http://127.0.0.1:8737/hex-rays"
+    )
+    assert (
+        uploads_api.public_base_from_request(
+            {"Host": "evil.example/steal"},
+            request_path="/mcp",
+        )
+        is None
+    )
+
+
+def test_upload_info_skips_wildcard_bind_without_request(inbox: Path) -> None:
+    uploads_api.set_http_bind("0.0.0.0", 8737)
+    info = mcp_api.upload_info()
+    assert info["available"] is True
+    assert info["url"] is None
+    assert info["path"] == "/uploads"
+    assert "$MCP_ORIGIN/uploads" in info["curl"]
+
+
+def test_upload_info_uses_request_origin_behind_proxy(inbox: Path) -> None:
+    uploads_api.set_http_bind("0.0.0.0", 8737)
+    with uploads_api.request_public_base_scope("https://ida.example.com"):
+        info = mcp_api.upload_info()
+    assert info["url"] == "https://ida.example.com/uploads"
+    assert info["path"] == "/uploads"
+
+
+def test_upload_info_keeps_path_prefix_in_url_and_path(inbox: Path) -> None:
+    uploads_api.set_http_bind("127.0.0.1", 8737, "/hex-rays")
+    with uploads_api.request_public_base_scope("https://ida.example.com/hex-rays"):
+        info = mcp_api.upload_info()
+    assert info["url"] == "https://ida.example.com/hex-rays/uploads"
+    assert info["path"] == "/hex-rays/uploads"
+
+
+def test_upload_info_public_url_overrides_forwarded_origin(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        uploads_api.PUBLIC_URL_ENVIRONMENT_VARIABLE,
+        "https://forced.example/ida",
+    )
+    uploads_api.set_http_bind("127.0.0.1", 8737)
+    with uploads_api.request_public_base_scope("https://ida.example.com"):
+        info = mcp_api.upload_info()
+    assert info["url"] == "https://forced.example/ida/uploads"
+    assert info["path"] == "/ida/uploads"
+
+
+def test_upload_info_ignores_invalid_public_url(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(uploads_api.PUBLIC_URL_ENVIRONMENT_VARIABLE, "not-a-url")
+    uploads_api.set_http_bind("127.0.0.1", 8737)
+    info = mcp_api.upload_info()
+    assert info["url"] == "http://127.0.0.1:8737/uploads"
+
+
+def _mcp_structured_tool(
+    port: int,
+    name: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    request_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    request_headers.update(headers or {})
+    status, body = _http_json(
+        f"http://127.0.0.1:{port}/mcp",
+        method="POST",
+        data=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": name,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": {}},
+            }
+        ).encode(),
+        headers=request_headers,
+    )
+    assert status == 200, body
+    assert "error" not in body, body
+    result = body["result"]
+    assert result["isError"] is False
+    structured = result["structuredContent"]
+    assert isinstance(structured, dict)
+    return structured
+
+
+def test_upload_info_http_call_uses_forwarded_headers(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mcp_api, "_HTTP_SERVER_STARTED", False)
+    port = _free_port()
+    mcp_api.serve_http("127.0.0.1", port, background=True)
+    try:
+        _wait_for_port(port)
+        info = _mcp_structured_tool(
+            port,
+            "upload_info",
+            headers={
+                "X-Forwarded-Proto": "https",
+                "X-Forwarded-Host": "ida.example.com",
+            },
+        )
+        assert info["available"] is True
+        assert info["url"] == "https://ida.example.com/uploads"
+        assert info["path"] == "/uploads"
+        assert "secret-token" not in json.dumps(info)
+
+        via_host = _mcp_structured_tool(port, "upload_info")
+        assert via_host["url"] == f"http://127.0.0.1:{port}/uploads"
+    finally:
+        mcp_api.stop_http_server()
+
+
+def test_upload_info_http_call_public_url_overrides_host(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        uploads_api.PUBLIC_URL_ENVIRONMENT_VARIABLE, "https://forced.example"
+    )
+    monkeypatch.setattr(mcp_api, "_HTTP_SERVER_STARTED", False)
+    port = _free_port()
+    mcp_api.serve_http("127.0.0.1", port, background=True)
+    try:
+        _wait_for_port(port)
+        info = _mcp_structured_tool(
+            port,
+            "upload_info",
+            headers={
+                "X-Forwarded-Proto": "https",
+                "X-Forwarded-Host": "ida.example.com",
+            },
+        )
+        assert info["url"] == "https://forced.example/uploads"
+    finally:
+        mcp_api.stop_http_server()

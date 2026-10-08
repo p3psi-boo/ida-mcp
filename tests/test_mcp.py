@@ -226,6 +226,8 @@ def test_mcp_unsets_empty_forwarded_environment_variables(monkeypatch) -> None:
     monkeypatch.setenv("IDA_NEXUS_STATE_DIR", "")
     monkeypatch.setenv("IDA_MCP_STATE_DIR", "")
     monkeypatch.setenv("IDA_MCP_INBOX", "")
+    monkeypatch.setenv("IDA_MCP_UPLOAD_MAX_BYTES", "")
+    monkeypatch.setenv("IDA_MCP_PUBLIC_URL", "")
     monkeypatch.setenv("IDA_MCP_TOKEN", "")
 
     mcp_api._unset_empty_environment_variables()
@@ -235,6 +237,8 @@ def test_mcp_unsets_empty_forwarded_environment_variables(monkeypatch) -> None:
     assert "IDA_NEXUS_STATE_DIR" not in mcp_api.os.environ
     assert "IDA_MCP_STATE_DIR" not in mcp_api.os.environ
     assert "IDA_MCP_INBOX" not in mcp_api.os.environ
+    assert "IDA_MCP_UPLOAD_MAX_BYTES" not in mcp_api.os.environ
+    assert "IDA_MCP_PUBLIC_URL" not in mcp_api.os.environ
     assert "IDA_MCP_TOKEN" not in mcp_api.os.environ
 
 
