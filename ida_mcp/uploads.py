@@ -23,6 +23,7 @@ from ida_mcp.paths import get_mcp_inbox_dir
 
 TOKEN_ENVIRONMENT_VARIABLE = "IDA_MCP_TOKEN"
 UPLOAD_MAX_BYTES_ENVIRONMENT_VARIABLE = "IDA_MCP_UPLOAD_MAX_BYTES"
+PUBLIC_URL_ENVIRONMENT_VARIABLE = "IDA_MCP_PUBLIC_URL"
 
 MAX_CHUNK_BYTES = 1 * 1024 * 1024
 DEFAULT_UPLOAD_MAX_BYTES = 256 * 1024 * 1024
@@ -77,6 +78,22 @@ class ListUploadsResult(TypedDict):
 class DeleteUploadResult(TypedDict):
     deleted: bool
     upload_id: str
+
+
+class UploadInfoResult(TypedDict):
+    available: bool
+    url: str | None
+    method: str
+    auth_required: bool
+    max_bytes: int
+    multipart_field: str
+    filename_header: str
+    curl: str
+    hint: str
+
+
+_HTTP_BIND: tuple[str, int] | None = None
+_BIND_LOCK = threading.Lock()
 
 
 def get_mcp_token() -> str | None:
@@ -296,15 +313,23 @@ class UploadStore:
             meta, upload_dir, sample_path = self._load(parsed_id)
             size = sample_path.stat().st_size
             declared_size = _declared_size(meta)
+            stored = meta.get("expected_sha256")
+            stored_digest = stored if isinstance(stored, str) else None
+            expected = provided or normalize_sha256(stored_digest)
+            if meta.get("finished"):
+                digest = meta.get("sha256")
+                if not isinstance(digest, str):
+                    digest = file_sha256(sample_path)
+                if expected is not None and digest != expected:
+                    raise ValueError("sha256 mismatch")
+                path = str(assert_inside_inbox(sample_path, self.inbox))
+                return UploadFinishResult(path=path, size=size, sha256=digest)
             if size != declared_size:
                 raise ValueError(
                     f"upload size mismatch: received {size} bytes, "
                     f"declared {declared_size}"
                 )
             digest = file_sha256(sample_path)
-            stored = meta.get("expected_sha256")
-            stored_digest = stored if isinstance(stored, str) else None
-            expected = provided or normalize_sha256(stored_digest)
             if expected is not None and digest != expected:
                 raise ValueError("sha256 mismatch")
             os.chmod(sample_path, 0o600)
@@ -314,6 +339,14 @@ class UploadStore:
             self._write_meta(upload_dir, meta)
             path = str(assert_inside_inbox(sample_path, self.inbox))
         return UploadFinishResult(path=path, size=size, sha256=digest)
+
+    def confirm(
+        self,
+        upload_id: str,
+        sha256: str | None = None,
+    ) -> UploadFinishResult:
+        """Acknowledge a sample already stored by HTTP POST /uploads."""
+        return self.finish(upload_id, sha256)
 
     def store_bytes(
         self,
@@ -500,6 +533,79 @@ def _remove_tree(path: Path) -> None:
         path.rmdir()
         return
     path.unlink()
+
+
+def set_http_bind(host: str, port: int) -> None:
+    global _HTTP_BIND
+    with _BIND_LOCK:
+        _HTTP_BIND = (host, port)
+
+
+def clear_http_bind() -> None:
+    global _HTTP_BIND
+    with _BIND_LOCK:
+        _HTTP_BIND = None
+
+
+def _public_origin(host: str, port: int) -> str:
+    override = os.environ.get(PUBLIC_URL_ENVIRONMENT_VARIABLE)
+    if override and override.strip():
+        return override.strip().rstrip("/")
+    value = host.strip()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    if ":" in value:
+        value = f"[{value}]"
+    return f"http://{value}:{port}"
+
+
+def http_upload_info() -> UploadInfoResult:
+    """Describe the HTTP sample-upload API without exposing the bearer token."""
+    auth_required = get_mcp_token() is not None
+    max_bytes = get_upload_max_bytes()
+    with _BIND_LOCK:
+        bind = _HTTP_BIND
+    if bind is None:
+        return UploadInfoResult(
+            available=False,
+            url=None,
+            method="POST",
+            auth_required=auth_required,
+            max_bytes=max_bytes,
+            multipart_field="file",
+            filename_header="X-Filename",
+            curl="",
+            hint=(
+                "HTTP upload is available only when this process was started with "
+                "ida-mcp http. Call upload_info again on the HTTP server, POST the "
+                "sample to /uploads, then confirm_upload(upload_id) and "
+                "open_database(path). Do not send file bytes through MCP tools."
+            ),
+        )
+    url = f"{_public_origin(*bind)}/uploads"
+    auth = ' -H "Authorization: Bearer $IDA_MCP_TOKEN"' if auth_required else ""
+    curl = (
+        f'curl -fsS{auth} -F "file=@sample.bin" {url}\n'
+        f'curl -fsS{auth} -H "X-Filename: sample.bin" '
+        f"--data-binary @sample.bin {url}"
+    )
+    return UploadInfoResult(
+        available=True,
+        url=url,
+        method="POST",
+        auth_required=auth_required,
+        max_bytes=max_bytes,
+        multipart_field="file",
+        filename_header="X-Filename",
+        curl=curl,
+        hint=(
+            "POST the sample to url with curl or an HTTP client. Use the JSON "
+            "upload_id in confirm_upload, then pass the returned path to "
+            "open_database. Do not send file bytes through MCP. If auth_required "
+            "is true, send Authorization: Bearer <token>; this result never "
+            "includes the token."
+        ),
+    )
 
 
 def get_upload_store() -> UploadStore:

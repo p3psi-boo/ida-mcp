@@ -8,15 +8,13 @@ This server exposes a compact surface for the ida-domain API:
 - save_database(...): explicitly save an active database
 - close_database(...): release this MCP server's handle and lease
 
-Remote agents can also upload samples into a server-local inbox, then pass the
-returned absolute path to open_database. Those tools never open a database
-themselves.
+Remote agents upload samples over HTTP (POST /uploads), then confirm through
+MCP and pass the returned absolute path to open_database. MCP tools never
+carry file bytes and never open a database themselves.
 """
 
 import asyncio
 import atexit
-import base64
-import binascii
 import inspect
 import json
 import math
@@ -60,17 +58,20 @@ from ida_mcp.paths import (
     get_mcp_state_dir,
 )
 from ida_mcp.uploads import (
+    PUBLIC_URL_ENVIRONMENT_VARIABLE,
     TOKEN_ENVIRONMENT_VARIABLE,
     UPLOAD_MAX_BYTES_ENVIRONMENT_VARIABLE,
     DeleteUploadResult,
     ListUploadsResult,
-    UploadBeginResult,
-    UploadChunkResult,
     UploadFinishResult,
+    UploadInfoResult,
+    clear_http_bind,
     ensure_inbox_dir,
     get_mcp_token,
     get_upload_store,
+    http_upload_info,
     leased_database_paths,
+    set_http_bind,
 )
 
 MCP_IDLE_TIMEOUT_ENVIRONMENT_VARIABLE = "IDA_MCP_IDLE_TIMEOUT"
@@ -83,6 +84,7 @@ MCP_ENVIRONMENT_VARIABLES = (
     STATE_DIR_ENVIRONMENT_VARIABLE,
     INBOX_DIR_ENVIRONMENT_VARIABLE,
     UPLOAD_MAX_BYTES_ENVIRONMENT_VARIABLE,
+    PUBLIC_URL_ENVIRONMENT_VARIABLE,
     TOKEN_ENVIRONMENT_VARIABLE,
     MCP_IDLE_TIMEOUT_ENVIRONMENT_VARIABLE,
 )
@@ -148,8 +150,9 @@ MCP_SERVER_INSTRUCTIONS = (
     "decompile to pseudocode, disassemble (disasm), xrefs, symbols, strings, imports, "
     "types. Use instead of objdump, readelf, nm or strings when you need decompilation "
     "or cross-references. open_database(path) only opens a path on this MCP server. "
-    "Remote samples must be uploaded first: upload_begin, upload_chunk in a loop, "
-    "upload_finish, then open_database with the returned server path."
+    "Remote samples: call upload_info for the HTTP POST /uploads URL, upload with "
+    "curl, then confirm_upload(upload_id) and open_database(path). Do not send file "
+    "bytes through MCP tools."
 )
 mcp = McpServer("ida", version=PACKAGE_VERSION, instructions=MCP_SERVER_INSTRUCTIONS)
 
@@ -467,11 +470,7 @@ def _require_http_bind_token(host: str) -> None:
 
 
 def _trace_tool_input(arguments: Mapping[str, Any]) -> dict[str, Any]:
-    payload = dict(arguments)
-    data = payload.get("data_base64")
-    if isinstance(data, str):
-        payload["data_base64"] = f"<omitted {len(data)} chars>"
-    return payload
+    return dict(arguments)
 
 
 def serve_http(
@@ -527,10 +526,12 @@ def serve_http(
             DATABASE_MANAGER.shutdown()
             DATABASE_MANAGER = previous_manager
         mcp.stop()
+        clear_http_bind()
         raise
 
     previous_manager.shutdown()
     _HTTP_SERVER_STARTED = True
+    set_http_bind(host, port)
     _start_mcp_trace(
         f"http://{host}:{port}{mcp.path_prefix}/mcp",
         agent,
@@ -565,6 +566,7 @@ def stop_http_server() -> None:
     if not _HTTP_SERVER_STARTED:
         return
     _HTTP_SERVER_STARTED = False
+    clear_http_bind()
     mcp.stop()
     _shutdown_server_state()
 
@@ -1004,87 +1006,45 @@ def close_database(
     return DATABASE_MANAGER.close_database(instance_id)
 
 
-def _decode_upload_chunk(data_base64: str) -> bytes:
-    if not isinstance(data_base64, str):
-        raise ValueError("data_base64 must be a string")  # noqa: TRY004
-    try:
-        return base64.b64decode(data_base64, validate=True)
-    except (binascii.Error, ValueError) as error:
-        raise ValueError("data_base64 is not valid base64") from error
+@tool(title="Show sample upload HTTP API", read_only=True)
+def upload_info() -> UploadInfoResult:
+    """Return the HTTP URL and curl examples for uploading a sample.
 
-
-@tool(title="Begin sample upload")
-def upload_begin(
-    filename: Annotated[
-        str,
-        "Original sample filename. Only the basename is kept; empty names become sample.bin.",
-    ],
-    size: Annotated[int, "Total size of the sample in bytes."],
-    sha256: Annotated[
-        str | None,
-        "Optional SHA-256 hex digest checked when upload_finish is called.",
-    ] = None,
-) -> UploadBeginResult:
-    """Start a chunked upload into the server inbox.
-
-    Recommended flow for a remote agent: upload_begin -> upload_chunk in a loop
-    -> upload_finish -> open_database(path). This tool does not call
-    open_database. The sample must land on this server; a path on the agent
-    disk cannot be opened here.
+    Recommended flow: upload_info -> POST the file to url (curl or HTTP client)
+    -> confirm_upload(upload_id) -> open_database(path). Do not send file bytes
+    through MCP tools. This tool does not call open_database and never returns
+    the bearer token.
     """
 
-    return get_upload_store().begin(filename, size, sha256)
+    return http_upload_info()
 
 
-@tool(title="Upload sample chunk")
-def upload_chunk(
-    upload_id: Annotated[str, "Identifier returned by upload_begin."],
-    offset: Annotated[
-        int, "Byte offset to write. Retrying the same range overwrites it."
-    ],
-    data_base64: Annotated[
+@tool(title="Confirm uploaded sample")
+def confirm_upload(
+    upload_id: Annotated[
         str,
-        "Base64-encoded chunk. Decoded size must not exceed 1 MiB.",
+        "upload_id from the POST /uploads JSON response.",
     ],
-) -> UploadChunkResult:
-    """Write one chunk of an in-progress inbox upload.
-
-    Recommended flow: upload_begin -> upload_chunk in a loop -> upload_finish ->
-    open_database(path). This tool does not call open_database. The same offset
-    may be retried; unfinished uploads survive server restart and can continue
-    with the same upload_id.
-    """
-
-    return get_upload_store().write_chunk(
-        upload_id,
-        offset,
-        _decode_upload_chunk(data_base64),
-    )
-
-
-@tool(title="Finish sample upload")
-def upload_finish(
-    upload_id: Annotated[str, "Identifier returned by upload_begin."],
     sha256: Annotated[
         str | None,
-        "Optional SHA-256 hex digest. Overrides the digest from upload_begin when set.",
+        "Optional SHA-256 hex digest to verify the stored sample.",
     ] = None,
 ) -> UploadFinishResult:
-    """Complete an inbox upload and return a server-local path.
+    """Tell the server a curl/HTTP upload finished and return its local path.
 
-    Recommended flow: upload_begin -> upload_chunk in a loop -> upload_finish ->
-    open_database(path). This tool does not call open_database. Pass the returned
-    absolute path to open_database unchanged.
+    Recommended flow: upload_info -> POST /uploads -> confirm_upload ->
+    open_database(path). This tool does not call open_database and does not
+    accept file bytes.
     """
 
-    return get_upload_store().finish(upload_id, sha256)
+    return get_upload_store().confirm(upload_id, sha256)
 
 
 @tool(title="List inbox uploads", read_only=True)
 def list_uploads() -> ListUploadsResult:
     """List pending and completed samples in the server inbox.
 
-    Recommended flow: upload_begin -> upload_chunk in a loop -> upload_finish ->
+    Recommended flow: upload_info -> POST /uploads -> confirm_upload ->
     open_database(path). This tool does not call open_database.
     """
 
@@ -1097,7 +1057,7 @@ def delete_upload(
 ) -> DeleteUploadResult:
     """Delete one inbox upload. Paths outside the inbox are rejected.
 
-    Recommended flow: upload_begin -> upload_chunk in a loop -> upload_finish ->
+    Recommended flow: upload_info -> POST /uploads -> confirm_upload ->
     open_database(path). This tool does not call open_database. If the sample is
     held by a database lease, close_database first.
     """

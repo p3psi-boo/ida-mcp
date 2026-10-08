@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import socket
@@ -38,6 +37,7 @@ def inbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     )
     yield path
     uploads_api.reset_upload_store()
+    uploads_api.clear_http_bind()
     mcp_api.mcp.stop()
     mcp_api.stop_http_server()
 
@@ -178,60 +178,82 @@ def test_delete_upload_refuses_leased_inbox_path(inbox: Path) -> None:
     assert not Path(finished["path"]).exists()
 
 
-def test_mcp_chunked_upload_path_is_usable_by_open_database(
+def test_upload_info_is_unavailable_without_http(inbox: Path) -> None:
+    info = mcp_api.upload_info()
+    assert info["available"] is False
+    assert info["url"] is None
+    assert "ida-mcp http" in info["hint"]
+    assert "secret" not in json.dumps(info)
+
+
+def test_http_upload_then_confirm_is_usable_by_open_database(
     inbox: Path,
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
-    payload = b"\x7fELFsample"
-    digest = _sha256(payload)
-    begun = mcp_api.upload_begin("remote.elf", len(payload), digest)
-    chunk = mcp_api.upload_chunk(
-        begun["upload_id"],
-        0,
-        base64.b64encode(payload).decode("ascii"),
-    )
-    assert chunk["written"] == len(payload)
-    finished = mcp_api.upload_finish(begun["upload_id"], digest)
+    monkeypatch.setattr(mcp_api, "_HTTP_SERVER_STARTED", False)
+    port = _free_port()
+    mcp_api.serve_http("127.0.0.1", port, background=True)
+    try:
+        _wait_for_port(port)
+        info = mcp_api.upload_info()
+        assert info["available"] is True
+        assert info["url"] == f"http://127.0.0.1:{port}/uploads"
+        assert info["method"] == "POST"
+        assert info["auth_required"] is False
+        assert "Bearer" not in info["curl"]
+        assert "secret-token" not in json.dumps(info)
 
-    path = Path(finished["path"])
-    assert path.resolve().is_relative_to(inbox.resolve())
-    assert path.read_bytes() == payload
+        payload = b"\x7fELFsample"
+        status, posted = _http_json(
+            info["url"] or "",
+            method="POST",
+            data=payload,
+            headers={
+                "X-Filename": "remote.elf",
+                "Content-Type": "application/octet-stream",
+            },
+        )
+        assert status == 200
+        confirmed = mcp_api.confirm_upload(posted["upload_id"], posted["sha256"])
+        path = Path(confirmed["path"])
+        assert path.resolve().is_relative_to(inbox.resolve())
+        assert path.read_bytes() == payload
 
-    manager = Mock()
-    manager.open_database.return_value = {
-        "instance_id": "worker-1",
-        "backend": "idalib",
-        "status": "current",
-        "recovery": "none",
-    }
-    monkeypatch.setattr(mcp_api, "DATABASE_MANAGER", manager)
-    monkeypatch.setattr(
-        mcp_api,
-        "TRACE",
-        type("Trace", (), {"path": tmp_path / "trace.jsonl", "emit": Mock()})(),
-    )
-
-    opened = mcp_api.open_database(finished["path"])
-    assert opened["instance_id"] == "worker-1"
-    manager.open_database.assert_called_once_with(
-        finished["path"],
-        set_current=True,
-        options=DatabaseOpenOptions(),
-    )
+        manager = Mock()
+        manager.open_database.return_value = {
+            "instance_id": "worker-1",
+            "backend": "idalib",
+            "status": "current",
+            "recovery": "none",
+        }
+        monkeypatch.setattr(mcp_api, "DATABASE_MANAGER", manager)
+        opened = mcp_api.open_database(confirmed["path"])
+        assert opened["instance_id"] == "worker-1"
+        manager.open_database.assert_called_once_with(
+            confirmed["path"],
+            set_current=True,
+            options=DatabaseOpenOptions(),
+        )
+    finally:
+        mcp_api.stop_http_server()
 
 
-def test_mcp_upload_chunk_rejects_invalid_base64(inbox: Path) -> None:
-    begun = mcp_api.upload_begin("sample.bin", 4)
-    with pytest.raises(McpToolError, match="base64"):
-        mcp_api.upload_chunk(begun["upload_id"], 0, "????")
+def test_upload_info_does_not_return_token(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(uploads_api.TOKEN_ENVIRONMENT_VARIABLE, "secret-token")
+    info = mcp_api.upload_info()
+    dumped = json.dumps(info)
+    assert "secret-token" not in dumped
+    assert info["auth_required"] is True
+    if info["curl"]:
+        assert "$IDA_MCP_TOKEN" in info["curl"]
 
 
-def test_mcp_upload_chunk_rejects_decoded_payload_over_1_mib(inbox: Path) -> None:
-    begun = mcp_api.upload_begin("sample.bin", uploads_api.MAX_CHUNK_BYTES + 1)
-    payload = base64.b64encode(b"x" * (uploads_api.MAX_CHUNK_BYTES + 1)).decode("ascii")
-    with pytest.raises(McpToolError, match="max_chunk_bytes"):
-        mcp_api.upload_chunk(begun["upload_id"], 0, payload)
+def test_confirm_upload_rejects_sha256_mismatch(inbox: Path) -> None:
+    stored = UploadStore(inbox).store_bytes("sample.bin", b"abc")
+    with pytest.raises(McpToolError, match="sha256 mismatch"):
+        mcp_api.confirm_upload(stored["upload_id"], "0" * 64)
 
 
 def test_upload_tools_are_registered_after_existing_tools() -> None:
@@ -245,13 +267,14 @@ def test_upload_tools_are_registered_after_existing_tools() -> None:
         "close_database",
     ]
     for name in (
-        "upload_begin",
-        "upload_chunk",
-        "upload_finish",
+        "upload_info",
+        "confirm_upload",
         "list_uploads",
         "delete_upload",
     ):
         assert name in names
+    for name in ("upload_begin", "upload_chunk", "upload_finish"):
+        assert name not in names
 
 
 def test_non_loopback_http_requires_token(
@@ -290,6 +313,8 @@ def test_http_uploads_and_mcp_share_port(
         listed_status, listed = _http_json(f"http://127.0.0.1:{port}/uploads")
         assert listed_status == 200
         assert listed["uploads"][0]["upload_id"] == body["upload_id"]
+        confirmed = mcp_api.confirm_upload(body["upload_id"])
+        assert confirmed["path"] == body["path"]
 
         mcp_status, mcp_body = _http_json(
             f"http://127.0.0.1:{port}/mcp",
@@ -424,17 +449,13 @@ def test_delete_upload_tool_uses_lease_paths(
     inbox: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     payload = b"open-me"
-    begun = mcp_api.upload_begin("held.bin", len(payload))
-    mcp_api.upload_chunk(
-        begun["upload_id"], 0, base64.b64encode(payload).decode("ascii")
-    )
-    finished = mcp_api.upload_finish(begun["upload_id"])
+    stored = UploadStore(inbox).store_bytes("held.bin", payload)
     manager = Mock()
-    manager.list_databases.return_value = {"instances": [{"path": finished["path"]}]}
+    manager.list_databases.return_value = {"instances": [{"path": stored["path"]}]}
     manager._instances = {}
     monkeypatch.setattr(mcp_api, "DATABASE_MANAGER", manager)
     with pytest.raises(McpToolError, match="close_database"):
-        mcp_api.delete_upload(begun["upload_id"])
+        mcp_api.delete_upload(stored["upload_id"])
 
 
 def test_uuid_directory_layout(inbox: Path) -> None:

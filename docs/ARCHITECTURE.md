@@ -47,17 +47,16 @@ The process-wide ZeroMCP server exposes six database tools:
 - `close_database(instance_id=None)`
 
 Those signatures are unchanged. Remote agents also get inbox tools that never
-open a database:
+open a database and never accept file bytes:
 
-- `upload_begin(filename, size, sha256=None)`
-- `upload_chunk(upload_id, offset, data_base64)`
-- `upload_finish(upload_id, sha256=None)`
+- `upload_info()`
+- `confirm_upload(upload_id, sha256=None)`
 - `list_uploads()`
 - `delete_upload(upload_id)`
 
-`open_database` still requires a path on the MCP server. A remote agent uploads
-into the inbox (`upload_begin` → `upload_chunk` → `upload_finish`) and then
-passes the returned absolute path to `open_database`. Samples are stored at
+`open_database` still requires a path on the MCP server. A remote agent calls
+`upload_info` for the `POST /uploads` URL, uploads with curl or another HTTP
+client, then `confirm_upload` and `open_database(path)`. Samples are stored at
 `inbox/<upload_id>/<filename>`. The inbox is `IDA_MCP_INBOX`, or
 `<IDA_MCP_STATE_DIR>/inbox`, or `<IDAUSR>/mcp/inbox`. Projects are distinguished
 by those filesystem paths; there is no extra session model.

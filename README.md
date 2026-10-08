@@ -145,49 +145,40 @@ To test the GUI integration, open something in IDA and ask your harness:
 
 > What do I have open in the IDA GUI?
 
-## Remote samples: upload, then open
+## Remote samples: HTTP upload, then MCP confirm
 
 `open_database(path)` only opens a **server-local** path. IDA and idalib run on
 the machine that hosts this MCP server. A file that exists only on a remote
-agent's disk is not visible there, so the agent must upload the sample into the
-server inbox and then call `open_database` with the returned absolute path.
+agent's disk is not visible there. MCP tools do not accept file bytes; they
+point at the HTTP upload API, then confirm the stored sample.
 
-Do not open a database from the upload tools. The intended agent sequence is:
+Intended sequence:
 
-1. `upload_begin(filename, size, sha256?)` → `{upload_id, max_chunk_bytes}`
-2. `upload_chunk(upload_id, offset, data_base64)` in a loop (1 MiB decoded max
-   per chunk; the same offset may be retried)
-3. `upload_finish(upload_id, sha256?)` → `{path, size, sha256}`
+1. `upload_info()` → HTTP `url`, curl examples, whether a bearer token is required
+2. Upload with curl (or any HTTP client) to `POST /uploads`
+3. `confirm_upload(upload_id)` with the JSON `upload_id` → `{path, size, sha256}`
 4. `open_database(path)` with that server path
 
-`list_uploads` shows pending and completed inbox objects. `delete_upload` removes
-one; if that path is held by a database lease, close it with `close_database`
-first. Unfinished uploads survive process restart and can continue with the same
-`upload_id`.
-
-People and scripts can upload on the same HTTP port without using MCP:
-
 ```bash
-# Raw body
-curl -fsS -H "Authorization: Bearer $IDA_MCP_TOKEN" \
-  -H "X-Filename: sample.elf" \
-  --data-binary @sample.elf \
-  http://127.0.0.1:8737/uploads
-
-# Multipart field "file"
+# Ask the MCP server for the URL, then:
 curl -fsS -H "Authorization: Bearer $IDA_MCP_TOKEN" \
   -F "file=@sample.elf" \
   http://127.0.0.1:8737/uploads
 
+# Raw body instead of multipart
 curl -fsS -H "Authorization: Bearer $IDA_MCP_TOKEN" \
+  -H "X-Filename: sample.elf" \
+  --data-binary @sample.elf \
   http://127.0.0.1:8737/uploads
-
-curl -fsS -X DELETE -H "Authorization: Bearer $IDA_MCP_TOKEN" \
-  http://127.0.0.1:8737/uploads/<upload_id>
 ```
 
-Successful responses are JSON with `upload_id`, `path`, `size`, and `sha256`.
-`/uploads` shares the process with Streamable HTTP MCP (`/mcp`) and does not
+The JSON response includes `upload_id`, `path`, `size`, and `sha256`. Humans can
+stop there and call `open_database` with `path`. Agents should still call
+`confirm_upload` so the path comes back through MCP. `list_uploads` lists the
+inbox; `delete_upload` removes one object (refused while a database lease holds
+it — `close_database` first).
+
+`/uploads` shares the HTTP port with Streamable MCP (`/mcp`) and does not
 replace it.
 
 ### Environment variables
@@ -197,6 +188,7 @@ replace it.
 | `IDA_MCP_INBOX` | Inbox directory. Default: `<IDA_MCP_STATE_DIR>/inbox`, or `<IDAUSR>/mcp/inbox` when the state directory is unset. Created at startup with mode `0700`. |
 | `IDA_MCP_UPLOAD_MAX_BYTES` | Maximum sample size in bytes. Default: `268435456` (256 MiB). |
 | `IDA_MCP_TOKEN` | If set, Streamable HTTP MCP and `/uploads` require `Authorization: Bearer <token>`. Never logged or returned by tools. |
+| `IDA_MCP_PUBLIC_URL` | Optional public origin advertised by `upload_info` (for reverse proxies). Default: `http://<host>:<port>`. |
 | `IDA_MCP_STATE_DIR` | MCP state directory (sessions and, by default, the inbox). |
 
 Binding HTTP to anything other than `127.0.0.1` or `::1` without `IDA_MCP_TOKEN`
