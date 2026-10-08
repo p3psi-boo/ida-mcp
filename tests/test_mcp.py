@@ -31,7 +31,9 @@ def test_programmatic_http_server_builds_manager_and_uses_prefix(
         _port: int,
         *,
         path_prefix: str,
+        request_handler: object | None = None,
     ) -> None:
+        del request_handler
         monkeypatch.setattr(mcp_api.mcp, "path_prefix", path_prefix.rstrip("/"))
 
     serve = Mock(side_effect=serve_with_prefix)
@@ -68,10 +70,13 @@ def test_programmatic_http_server_builds_manager_and_uses_prefix(
         "on_event": mcp_api._trace_database_event,
     }
     assert isinstance(mcp_api.DATABASE_MANAGER, HostManager)
+    from ida_mcp.http import IdaMcpHttpRequestHandler
+
     serve.assert_called_once_with(
         "127.0.0.1",
         18737,
         path_prefix="/hex-rays/",
+        request_handler=IdaMcpHttpRequestHandler,
     )
     trace.assert_called_once_with(
         "http://127.0.0.1:18737/hex-rays/mcp",
@@ -220,6 +225,8 @@ def test_mcp_unsets_empty_forwarded_environment_variables(monkeypatch) -> None:
     monkeypatch.setenv("IDAUSR", "/tmp/ida-user")
     monkeypatch.setenv("IDA_NEXUS_STATE_DIR", "")
     monkeypatch.setenv("IDA_MCP_STATE_DIR", "")
+    monkeypatch.setenv("IDA_MCP_INBOX", "")
+    monkeypatch.setenv("IDA_MCP_TOKEN", "")
 
     mcp_api._unset_empty_environment_variables()
 
@@ -227,6 +234,8 @@ def test_mcp_unsets_empty_forwarded_environment_variables(monkeypatch) -> None:
     assert mcp_api.os.environ["IDAUSR"] == "/tmp/ida-user"
     assert "IDA_NEXUS_STATE_DIR" not in mcp_api.os.environ
     assert "IDA_MCP_STATE_DIR" not in mcp_api.os.environ
+    assert "IDA_MCP_INBOX" not in mcp_api.os.environ
+    assert "IDA_MCP_TOKEN" not in mcp_api.os.environ
 
 
 def test_mcp_gui_plugin_requires_current_or_newer_version(tmp_path: Path) -> None:

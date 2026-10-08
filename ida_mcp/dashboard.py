@@ -1591,6 +1591,11 @@ _MCP_TOOL_NAMES = {
     "list_databases",
     "save_database",
     "close_database",
+    "upload_begin",
+    "upload_chunk",
+    "upload_finish",
+    "list_uploads",
+    "delete_upload",
 }
 
 

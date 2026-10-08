@@ -14,7 +14,7 @@
       "name": "ida",
       "version": "<package-version>"
     },
-    "instructions": "IDA Pro reverse engineering of compiled binaries (ELF, PE, Mach-O, firmware): decompile to pseudocode, disassemble (disasm), xrefs, symbols, strings, imports, types. Use instead of objdump, readelf, nm or strings when you need decompilation or cross-references."
+    "instructions": "IDA Pro reverse engineering of compiled binaries (ELF, PE, Mach-O, firmware): decompile to pseudocode, disassemble (disasm), xrefs, symbols, strings, imports, types. Use instead of objdump, readelf, nm or strings when you need decompilation or cross-references. open_database(path) only opens a path on this MCP server. Remote samples must be uploaded first: upload_begin, upload_chunk in a loop, upload_finish, then open_database with the returned server path."
   },
   "tools/list": {
     "tools": [
@@ -328,6 +328,257 @@
           },
           "required": [
             "closed"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "upload_begin",
+        "description": "Start a chunked upload into the server inbox.\n\nRecommended flow for a remote agent: upload_begin -> upload_chunk in a loop\n-> upload_finish -> open_database(path). This tool does not call\nopen_database. The sample must land on this server; a path on the agent\ndisk cannot be opened here.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filename": {
+              "type": "string",
+              "description": "Original sample filename. Only the basename is kept; empty names become sample.bin."
+            },
+            "size": {
+              "type": "integer",
+              "description": "Total size of the sample in bytes."
+            },
+            "sha256": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional SHA-256 hex digest checked when upload_finish is called.",
+              "default": null
+            }
+          },
+          "required": [
+            "filename",
+            "size"
+          ]
+        },
+        "title": "Begin sample upload",
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "upload_id": {
+              "type": "string"
+            },
+            "max_chunk_bytes": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "upload_id",
+            "max_chunk_bytes"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "upload_chunk",
+        "description": "Write one chunk of an in-progress inbox upload.\n\nRecommended flow: upload_begin -> upload_chunk in a loop -> upload_finish ->\nopen_database(path). This tool does not call open_database. The same offset\nmay be retried; unfinished uploads survive server restart and can continue\nwith the same upload_id.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "upload_id": {
+              "type": "string",
+              "description": "Identifier returned by upload_begin."
+            },
+            "offset": {
+              "type": "integer",
+              "description": "Byte offset to write. Retrying the same range overwrites it."
+            },
+            "data_base64": {
+              "type": "string",
+              "description": "Base64-encoded chunk. Decoded size must not exceed 1 MiB."
+            }
+          },
+          "required": [
+            "upload_id",
+            "offset",
+            "data_base64"
+          ]
+        },
+        "title": "Upload sample chunk",
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "upload_id": {
+              "type": "string"
+            },
+            "offset": {
+              "type": "integer"
+            },
+            "written": {
+              "type": "integer"
+            },
+            "received_size": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "upload_id",
+            "offset",
+            "written",
+            "received_size"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "upload_finish",
+        "description": "Complete an inbox upload and return a server-local path.\n\nRecommended flow: upload_begin -> upload_chunk in a loop -> upload_finish ->\nopen_database(path). This tool does not call open_database. Pass the returned\nabsolute path to open_database unchanged.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "upload_id": {
+              "type": "string",
+              "description": "Identifier returned by upload_begin."
+            },
+            "sha256": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional SHA-256 hex digest. Overrides the digest from upload_begin when set.",
+              "default": null
+            }
+          },
+          "required": [
+            "upload_id"
+          ]
+        },
+        "title": "Finish sample upload",
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "size": {
+              "type": "integer"
+            },
+            "sha256": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "size",
+            "sha256"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "list_uploads",
+        "description": "List pending and completed samples in the server inbox.\n\nRecommended flow: upload_begin -> upload_chunk in a loop -> upload_finish ->\nopen_database(path). This tool does not call open_database.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        },
+        "title": "List inbox uploads",
+        "annotations": {
+          "readOnlyHint": true
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "uploads": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "upload_id": {
+                    "type": "string"
+                  },
+                  "filename": {
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "size": {
+                    "type": "integer"
+                  },
+                  "declared_size": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "status": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "upload_id",
+                  "filename",
+                  "path",
+                  "size",
+                  "declared_size",
+                  "sha256",
+                  "status"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "uploads"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "delete_upload",
+        "description": "Delete one inbox upload. Paths outside the inbox are rejected.\n\nRecommended flow: upload_begin -> upload_chunk in a loop -> upload_finish ->\nopen_database(path). This tool does not call open_database. If the sample is\nheld by a database lease, close_database first.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "upload_id": {
+              "type": "string",
+              "description": "Inbox upload identifier to delete."
+            }
+          },
+          "required": [
+            "upload_id"
+          ]
+        },
+        "title": "Delete inbox upload",
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "deleted": {
+              "type": "boolean"
+            },
+            "upload_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "deleted",
+            "upload_id"
           ],
           "additionalProperties": false
         }

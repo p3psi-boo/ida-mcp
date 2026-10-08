@@ -7,12 +7,17 @@ This server exposes a compact surface for the ida-domain API:
 - list_databases(): discover registered GUI and idalib database instances
 - save_database(...): explicitly save an active database
 - close_database(...): release this MCP server's handle and lease
+
+Remote agents can also upload samples into a server-local inbox, then pass the
+returned absolute path to open_database. Those tools never open a database
+themselves.
 """
 
 import asyncio
 import atexit
+import base64
+import binascii
 import inspect
-import ipaddress
 import json
 import math
 import os
@@ -49,7 +54,24 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-from ida_mcp.paths import STATE_DIR_ENVIRONMENT_VARIABLE, get_mcp_state_dir
+from ida_mcp.paths import (
+    INBOX_DIR_ENVIRONMENT_VARIABLE,
+    STATE_DIR_ENVIRONMENT_VARIABLE,
+    get_mcp_state_dir,
+)
+from ida_mcp.uploads import (
+    TOKEN_ENVIRONMENT_VARIABLE,
+    UPLOAD_MAX_BYTES_ENVIRONMENT_VARIABLE,
+    DeleteUploadResult,
+    ListUploadsResult,
+    UploadBeginResult,
+    UploadChunkResult,
+    UploadFinishResult,
+    ensure_inbox_dir,
+    get_mcp_token,
+    get_upload_store,
+    leased_database_paths,
+)
 
 MCP_IDLE_TIMEOUT_ENVIRONMENT_VARIABLE = "IDA_MCP_IDLE_TIMEOUT"
 MCP_ID_ENVIRONMENT_VARIABLE = "IDA_MCP_ID"
@@ -59,6 +81,9 @@ MCP_ENVIRONMENT_VARIABLES = (
     "IDAUSR",
     "IDA_NEXUS_STATE_DIR",
     STATE_DIR_ENVIRONMENT_VARIABLE,
+    INBOX_DIR_ENVIRONMENT_VARIABLE,
+    UPLOAD_MAX_BYTES_ENVIRONMENT_VARIABLE,
+    TOKEN_ENVIRONMENT_VARIABLE,
     MCP_IDLE_TIMEOUT_ENVIRONMENT_VARIABLE,
 )
 
@@ -122,7 +147,9 @@ MCP_SERVER_INSTRUCTIONS = (
     "IDA Pro reverse engineering of compiled binaries (ELF, PE, Mach-O, firmware): "
     "decompile to pseudocode, disassemble (disasm), xrefs, symbols, strings, imports, "
     "types. Use instead of objdump, readelf, nm or strings when you need decompilation "
-    "or cross-references."
+    "or cross-references. open_database(path) only opens a path on this MCP server. "
+    "Remote samples must be uploaded first: upload_begin, upload_chunk in a loop, "
+    "upload_finish, then open_database with the returned server path."
 )
 mcp = McpServer("ida", version=PACKAGE_VERSION, instructions=MCP_SERVER_INSTRUCTIONS)
 
@@ -414,11 +441,37 @@ def _validate_http_address(host: str, port: int) -> None:
         raise ValueError("port must be between 1 and 65535")
 
 
-def _is_loopback_host(host: str) -> bool:
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return host.casefold() == "localhost"
+def _is_loopback_bind_host(host: str) -> bool:
+    """Return whether HTTP may bind without IDA_MCP_TOKEN.
+
+    Only 127.0.0.1 and ::1 are exempt. Other loopback aliases, including
+    localhost, still require a token when used as ``--host``.
+    """
+    value = host.strip()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    return value in {"127.0.0.1", "::1"}
+
+
+def _require_http_bind_token(host: str) -> None:
+    if _is_loopback_bind_host(host) or get_mcp_token() is not None:
+        return
+    message = (
+        "refusing to bind HTTP to a non-loopback address without "
+        f"{TOKEN_ENVIRONMENT_VARIABLE}; host {host!r} is not 127.0.0.1 or ::1. "
+        "Set a bearer token so MCP and /uploads require "
+        "Authorization: Bearer <token>."
+    )
+    print(message, file=sys.stderr)
+    raise ValueError(message)
+
+
+def _trace_tool_input(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    payload = dict(arguments)
+    data = payload.get("data_base64")
+    if isinstance(data, str):
+        payload["data_base64"] = f"<omitted {len(data)} chars>"
+    return payload
 
 
 def serve_http(
@@ -437,6 +490,7 @@ def serve_http(
 
     global DATABASE_MANAGER, _HTTP_SERVER_STARTED
     _validate_http_address(host, port)
+    _require_http_bind_token(host)
     if _HTTP_SERVER_STARTED:
         raise RuntimeError("the Nexus HTTP MCP server is already running")
 
@@ -457,13 +511,22 @@ def serve_http(
 
     try:
         _unset_empty_environment_variables()
+        ensure_inbox_dir()
         if database:
             DATABASE_MANAGER.schedule_startup_open(database)
-        mcp.serve(host, port, path_prefix=path_prefix)
+        from ida_mcp.http import IdaMcpHttpRequestHandler
+
+        mcp.serve(
+            host,
+            port,
+            path_prefix=path_prefix,
+            request_handler=IdaMcpHttpRequestHandler,
+        )
     except Exception:
         if DATABASE_MANAGER is not previous_manager:
             DATABASE_MANAGER.shutdown()
             DATABASE_MANAGER = previous_manager
+        mcp.stop()
         raise
 
     previous_manager.shutdown()
@@ -472,12 +535,6 @@ def serve_http(
         f"http://{host}:{port}{mcp.path_prefix}/mcp",
         agent,
     )
-    if not _is_loopback_host(host):
-        print(
-            "WARNING: MCP HTTP transport is bound to a non-loopback host without "
-            "built-in authentication; execute_python may be reachable over the network.",
-            file=sys.stderr,
-        )
     if background:
         return
 
@@ -568,7 +625,7 @@ def _register_tool(func: Callable[P, R], metadata: ToolMetadata) -> Callable[P, 
             call_id=call_id,
             tool=name,
             session=session,
-            input=dict(arguments.arguments),
+            input=_trace_tool_input(arguments.arguments),
         )
         return name, call_id, session, time.monotonic()
 
@@ -947,6 +1004,110 @@ def close_database(
     return DATABASE_MANAGER.close_database(instance_id)
 
 
+def _decode_upload_chunk(data_base64: str) -> bytes:
+    if not isinstance(data_base64, str):
+        raise ValueError("data_base64 must be a string")  # noqa: TRY004
+    try:
+        return base64.b64decode(data_base64, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("data_base64 is not valid base64") from error
+
+
+@tool(title="Begin sample upload")
+def upload_begin(
+    filename: Annotated[
+        str,
+        "Original sample filename. Only the basename is kept; empty names become sample.bin.",
+    ],
+    size: Annotated[int, "Total size of the sample in bytes."],
+    sha256: Annotated[
+        str | None,
+        "Optional SHA-256 hex digest checked when upload_finish is called.",
+    ] = None,
+) -> UploadBeginResult:
+    """Start a chunked upload into the server inbox.
+
+    Recommended flow for a remote agent: upload_begin -> upload_chunk in a loop
+    -> upload_finish -> open_database(path). This tool does not call
+    open_database. The sample must land on this server; a path on the agent
+    disk cannot be opened here.
+    """
+
+    return get_upload_store().begin(filename, size, sha256)
+
+
+@tool(title="Upload sample chunk")
+def upload_chunk(
+    upload_id: Annotated[str, "Identifier returned by upload_begin."],
+    offset: Annotated[
+        int, "Byte offset to write. Retrying the same range overwrites it."
+    ],
+    data_base64: Annotated[
+        str,
+        "Base64-encoded chunk. Decoded size must not exceed 1 MiB.",
+    ],
+) -> UploadChunkResult:
+    """Write one chunk of an in-progress inbox upload.
+
+    Recommended flow: upload_begin -> upload_chunk in a loop -> upload_finish ->
+    open_database(path). This tool does not call open_database. The same offset
+    may be retried; unfinished uploads survive server restart and can continue
+    with the same upload_id.
+    """
+
+    return get_upload_store().write_chunk(
+        upload_id,
+        offset,
+        _decode_upload_chunk(data_base64),
+    )
+
+
+@tool(title="Finish sample upload")
+def upload_finish(
+    upload_id: Annotated[str, "Identifier returned by upload_begin."],
+    sha256: Annotated[
+        str | None,
+        "Optional SHA-256 hex digest. Overrides the digest from upload_begin when set.",
+    ] = None,
+) -> UploadFinishResult:
+    """Complete an inbox upload and return a server-local path.
+
+    Recommended flow: upload_begin -> upload_chunk in a loop -> upload_finish ->
+    open_database(path). This tool does not call open_database. Pass the returned
+    absolute path to open_database unchanged.
+    """
+
+    return get_upload_store().finish(upload_id, sha256)
+
+
+@tool(title="List inbox uploads", read_only=True)
+def list_uploads() -> ListUploadsResult:
+    """List pending and completed samples in the server inbox.
+
+    Recommended flow: upload_begin -> upload_chunk in a loop -> upload_finish ->
+    open_database(path). This tool does not call open_database.
+    """
+
+    return get_upload_store().list_uploads()
+
+
+@tool(title="Delete inbox upload")
+def delete_upload(
+    upload_id: Annotated[str, "Inbox upload identifier to delete."],
+) -> DeleteUploadResult:
+    """Delete one inbox upload. Paths outside the inbox are rejected.
+
+    Recommended flow: upload_begin -> upload_chunk in a loop -> upload_finish ->
+    open_database(path). This tool does not call open_database. If the sample is
+    held by a database lease, close_database first.
+    """
+
+    return get_upload_store().delete(
+        upload_id,
+        leased_paths=leased_database_paths(DATABASE_MANAGER),
+    )
+
+
 def _install_server_shutdown_handlers() -> None:
     def cleanup_and_exit(signum: int, _frame: Any) -> None:
         _shutdown_server_state()
@@ -1009,6 +1170,7 @@ def serve_stdio(
     previous_manager.shutdown()
 
     _unset_empty_environment_variables()
+    ensure_inbox_dir()
     _install_server_shutdown_handlers()
     _start_mcp_trace("stdio", agent)
     if database:

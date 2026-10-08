@@ -49,7 +49,7 @@ def test_plugin_ida_nexus_dependency_matches_pyproject() -> None:
 
 
 def test_moved_modules_are_importable() -> None:
-    for name in ("cli", "dashboard", "hooks", "logs", "mcp"):
+    for name in ("cli", "dashboard", "hooks", "http", "logs", "mcp", "uploads"):
         assert importlib.import_module(f"ida_mcp.{name}") is not None
 
 

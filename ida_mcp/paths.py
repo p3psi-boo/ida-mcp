@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 
 STATE_DIR_ENVIRONMENT_VARIABLE = "IDA_MCP_STATE_DIR"
+INBOX_DIR_ENVIRONMENT_VARIABLE = "IDA_MCP_INBOX"
 
 
 def _idausr_dir() -> Path:
@@ -34,6 +35,18 @@ def get_mcp_state_dir() -> Path:
     if state_dir:
         return Path(state_dir).expanduser()
     return _idausr_dir() / "mcp"
+
+
+def get_mcp_inbox_dir() -> Path:
+    """Return the sample inbox directory for remote uploads.
+
+    Overridable with ``IDA_MCP_INBOX``; defaults to ``<IDA_MCP_STATE_DIR>/inbox``,
+    which is ``<IDAUSR>/mcp/inbox`` when the state directory is unset.
+    """
+    inbox = os.environ.get(INBOX_DIR_ENVIRONMENT_VARIABLE)
+    if inbox:
+        return Path(inbox).expanduser()
+    return get_mcp_state_dir() / "inbox"
 
 
 def get_legacy_sessions_dir() -> Path:

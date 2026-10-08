@@ -21,6 +21,7 @@ def clean_session_state() -> Iterator[None]:
         _NEXUS_STATE_DIR / name for name in ("instances", "spawn", "logs", "sessions")
     ]
     dirs.append(_MCP_STATE_DIR / "sessions")
+    dirs.append(_MCP_STATE_DIR / "inbox")
     for directory in dirs:
         shutil.rmtree(directory, ignore_errors=True)
     yield

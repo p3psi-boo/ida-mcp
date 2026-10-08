@@ -37,7 +37,7 @@ operations therefore do not initialize the MCP server or database manager.
 
 ## Tool and database model
 
-The process-wide ZeroMCP server exposes six tools:
+The process-wide ZeroMCP server exposes six database tools:
 
 - `open_database(path, set_current=True)`
 - `execute_python(code, instance_id=None, timeout=360)`
@@ -45,6 +45,28 @@ The process-wide ZeroMCP server exposes six tools:
 - `list_databases()`
 - `save_database(instance_id=None)`
 - `close_database(instance_id=None)`
+
+Those signatures are unchanged. Remote agents also get inbox tools that never
+open a database:
+
+- `upload_begin(filename, size, sha256=None)`
+- `upload_chunk(upload_id, offset, data_base64)`
+- `upload_finish(upload_id, sha256=None)`
+- `list_uploads()`
+- `delete_upload(upload_id)`
+
+`open_database` still requires a path on the MCP server. A remote agent uploads
+into the inbox (`upload_begin` → `upload_chunk` → `upload_finish`) and then
+passes the returned absolute path to `open_database`. Samples are stored at
+`inbox/<upload_id>/<filename>`. The inbox is `IDA_MCP_INBOX`, or
+`<IDA_MCP_STATE_DIR>/inbox`, or `<IDAUSR>/mcp/inbox`. Projects are distinguished
+by those filesystem paths; there is no extra session model.
+
+The Streamable HTTP server also serves `POST/GET /uploads` and
+`DELETE /uploads/{upload_id}` on the same port as `/mcp`. When `IDA_MCP_TOKEN`
+is set, both the MCP transport and `/uploads` require
+`Authorization: Bearer <token>`. Binding HTTP to a non-loopback address without
+that token is refused. stdio is unaffected.
 
 `DatabaseManager` keeps MCP-local instance IDs and one lease for each attached
 Nexus database. Separate MCP server processes retain independent leases. Closing

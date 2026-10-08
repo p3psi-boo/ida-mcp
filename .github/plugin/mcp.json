@@ -17,7 +17,10 @@
         "IDA_MCP_IDLE_TIMEOUT": "${IDA_MCP_IDLE_TIMEOUT:-}",
         "IDAUSR": "${IDAUSR:-}",
         "IDA_NEXUS_STATE_DIR": "${IDA_NEXUS_STATE_DIR:-}",
-        "IDA_MCP_STATE_DIR": "${IDA_MCP_STATE_DIR:-}"
+        "IDA_MCP_STATE_DIR": "${IDA_MCP_STATE_DIR:-}",
+        "IDA_MCP_INBOX": "${IDA_MCP_INBOX:-}",
+        "IDA_MCP_UPLOAD_MAX_BYTES": "${IDA_MCP_UPLOAD_MAX_BYTES:-}",
+        "IDA_MCP_TOKEN": "${IDA_MCP_TOKEN:-}"
       },
       "tools": [
         "*"
