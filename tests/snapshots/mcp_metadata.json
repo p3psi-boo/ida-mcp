@@ -14,7 +14,7 @@
       "name": "ida",
       "version": "<package-version>"
     },
-    "instructions": "IDA Pro reverse engineering of compiled binaries (ELF, PE, Mach-O, firmware): decompile to pseudocode, disassemble (disasm), xrefs, symbols, strings, imports, types. Use instead of objdump, readelf, nm or strings when you need decompilation or cross-references."
+    "instructions": "IDA Pro reverse engineering of compiled binaries (ELF, PE, Mach-O, firmware): decompile to pseudocode, disassemble (disasm), xrefs, symbols, strings, imports, types. Use instead of objdump, readelf, nm or strings when you need decompilation or cross-references. open_database(path) only opens a path on this MCP server. Remote samples: call upload_info for the upload URL, upload with curl, then confirm_upload and open_database(path). Do not send file bytes through MCP tools. If IDA_MCP_WEBDAV_URL is set, PUT to that collection; confirm_upload pulls the object into this machine's inbox."
   },
   "tools/list": {
     "tools": [
@@ -328,6 +328,224 @@
           },
           "required": [
             "closed"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "upload_info",
+        "description": "Return the absolute HTTP URL for uploading a sample.\n\nAgents and curl do not have browser same-origin. If IDA_MCP_WEBDAV_URL is\nset, url is that collection and method is PUT (WebDAV on another machine;\nconfirm_upload GETs only that prefix into the local inbox). Otherwise url\nis built from this MCP request (Host, X-Forwarded-Proto, X-Forwarded-Host,\nForwarded) or IDA_MCP_PUBLIC_URL. Recommended flow: upload_info -> curl\n-> confirm_upload -> open_database(path). Do not send file bytes through\nMCP. Never returns credentials. Local stdio agents should pass a\nfilesystem path on this machine to open_database instead.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        },
+        "title": "Show sample upload HTTP API",
+        "annotations": {
+          "readOnlyHint": true
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "url": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "method": {
+              "type": "string"
+            },
+            "auth_required": {
+              "type": "boolean"
+            },
+            "max_bytes": {
+              "type": "integer"
+            },
+            "multipart_field": {
+              "type": "string"
+            },
+            "filename_header": {
+              "type": "string"
+            },
+            "curl": {
+              "type": "string"
+            },
+            "hint": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "available",
+            "url",
+            "path",
+            "method",
+            "auth_required",
+            "max_bytes",
+            "multipart_field",
+            "filename_header",
+            "curl",
+            "hint"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "confirm_upload",
+        "description": "Tell the server a curl/HTTP or WebDAV upload finished and return its local path.\n\nRecommended flow: upload_info -> curl -> confirm_upload -> open_database(path).\nFor a remote WebDAV drop zone this GETs {IDA_MCP_WEBDAV_URL}/{filename} into\nthe inbox; it does not fetch arbitrary URLs. This tool does not call\nopen_database and does not accept file bytes.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "upload_id": {
+              "type": "string",
+              "description": "upload_id from POST /uploads, or the filename PUT under IDA_MCP_WEBDAV_URL."
+            },
+            "sha256": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional SHA-256 hex digest to verify the stored sample.",
+              "default": null
+            }
+          },
+          "required": [
+            "upload_id"
+          ]
+        },
+        "title": "Confirm uploaded sample",
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "size": {
+              "type": "integer"
+            },
+            "sha256": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "size",
+            "sha256"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "list_uploads",
+        "description": "List pending and completed samples in the server inbox.\n\nRecommended flow: upload_info -> POST /uploads -> confirm_upload ->\nopen_database(path). This tool does not call open_database.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        },
+        "title": "List inbox uploads",
+        "annotations": {
+          "readOnlyHint": true
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "uploads": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "upload_id": {
+                    "type": "string"
+                  },
+                  "filename": {
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "size": {
+                    "type": "integer"
+                  },
+                  "declared_size": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "status": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "upload_id",
+                  "filename",
+                  "path",
+                  "size",
+                  "declared_size",
+                  "sha256",
+                  "status"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "uploads"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "delete_upload",
+        "description": "Delete one inbox upload. Paths outside the inbox are rejected.\n\nRecommended flow: upload_info -> POST /uploads -> confirm_upload ->\nopen_database(path). This tool does not call open_database. If the sample is\nheld by a database lease, close_database first.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "upload_id": {
+              "type": "string",
+              "description": "Inbox upload identifier to delete."
+            }
+          },
+          "required": [
+            "upload_id"
+          ]
+        },
+        "title": "Delete inbox upload",
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "deleted": {
+              "type": "boolean"
+            },
+            "upload_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "deleted",
+            "upload_id"
           ],
           "additionalProperties": false
         }

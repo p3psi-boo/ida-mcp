@@ -7,12 +7,15 @@ This server exposes a compact surface for the ida-domain API:
 - list_databases(): discover registered GUI and idalib database instances
 - save_database(...): explicitly save an active database
 - close_database(...): release this MCP server's handle and lease
+
+Remote agents upload samples over HTTP (POST /uploads), then confirm through
+MCP and pass the returned absolute path to open_database. MCP tools never
+carry file bytes and never open a database themselves.
 """
 
 import asyncio
 import atexit
 import inspect
-import ipaddress
 import json
 import math
 import os
@@ -49,7 +52,30 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-from ida_mcp.paths import STATE_DIR_ENVIRONMENT_VARIABLE, get_mcp_state_dir
+from ida_mcp.paths import (
+    INBOX_DIR_ENVIRONMENT_VARIABLE,
+    STATE_DIR_ENVIRONMENT_VARIABLE,
+    get_mcp_state_dir,
+)
+from ida_mcp.uploads import (
+    PUBLIC_URL_ENVIRONMENT_VARIABLE,
+    TOKEN_ENVIRONMENT_VARIABLE,
+    UPLOAD_MAX_BYTES_ENVIRONMENT_VARIABLE,
+    WEBDAV_PASSWORD_ENVIRONMENT_VARIABLE,
+    WEBDAV_URL_ENVIRONMENT_VARIABLE,
+    WEBDAV_USER_ENVIRONMENT_VARIABLE,
+    DeleteUploadResult,
+    ListUploadsResult,
+    UploadFinishResult,
+    UploadInfoResult,
+    clear_http_bind,
+    ensure_inbox_dir,
+    get_mcp_token,
+    get_upload_store,
+    http_upload_info,
+    leased_database_paths,
+    set_http_bind,
+)
 
 MCP_IDLE_TIMEOUT_ENVIRONMENT_VARIABLE = "IDA_MCP_IDLE_TIMEOUT"
 MCP_ID_ENVIRONMENT_VARIABLE = "IDA_MCP_ID"
@@ -59,6 +85,13 @@ MCP_ENVIRONMENT_VARIABLES = (
     "IDAUSR",
     "IDA_NEXUS_STATE_DIR",
     STATE_DIR_ENVIRONMENT_VARIABLE,
+    INBOX_DIR_ENVIRONMENT_VARIABLE,
+    UPLOAD_MAX_BYTES_ENVIRONMENT_VARIABLE,
+    PUBLIC_URL_ENVIRONMENT_VARIABLE,
+    TOKEN_ENVIRONMENT_VARIABLE,
+    WEBDAV_URL_ENVIRONMENT_VARIABLE,
+    WEBDAV_USER_ENVIRONMENT_VARIABLE,
+    WEBDAV_PASSWORD_ENVIRONMENT_VARIABLE,
     MCP_IDLE_TIMEOUT_ENVIRONMENT_VARIABLE,
 )
 
@@ -122,7 +155,11 @@ MCP_SERVER_INSTRUCTIONS = (
     "IDA Pro reverse engineering of compiled binaries (ELF, PE, Mach-O, firmware): "
     "decompile to pseudocode, disassemble (disasm), xrefs, symbols, strings, imports, "
     "types. Use instead of objdump, readelf, nm or strings when you need decompilation "
-    "or cross-references."
+    "or cross-references. open_database(path) only opens a path on this MCP server. "
+    "Remote samples: call upload_info for the upload URL, upload with curl, then "
+    "confirm_upload and open_database(path). Do not send file bytes through MCP "
+    "tools. If IDA_MCP_WEBDAV_URL is set, PUT to that collection; confirm_upload "
+    "pulls the object into this machine's inbox."
 )
 mcp = McpServer("ida", version=PACKAGE_VERSION, instructions=MCP_SERVER_INSTRUCTIONS)
 
@@ -414,11 +451,33 @@ def _validate_http_address(host: str, port: int) -> None:
         raise ValueError("port must be between 1 and 65535")
 
 
-def _is_loopback_host(host: str) -> bool:
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return host.casefold() == "localhost"
+def _is_loopback_bind_host(host: str) -> bool:
+    """Return whether HTTP may bind without IDA_MCP_TOKEN.
+
+    Only 127.0.0.1 and ::1 are exempt. Other loopback aliases, including
+    localhost, still require a token when used as ``--host``.
+    """
+    value = host.strip()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    return value in {"127.0.0.1", "::1"}
+
+
+def _require_http_bind_token(host: str) -> None:
+    if _is_loopback_bind_host(host) or get_mcp_token() is not None:
+        return
+    message = (
+        "refusing to bind HTTP to a non-loopback address without "
+        f"{TOKEN_ENVIRONMENT_VARIABLE}; host {host!r} is not 127.0.0.1 or ::1. "
+        "Set a bearer token so MCP and /uploads require "
+        "Authorization: Bearer <token>."
+    )
+    print(message, file=sys.stderr)
+    raise ValueError(message)
+
+
+def _trace_tool_input(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    return dict(arguments)
 
 
 def serve_http(
@@ -437,6 +496,7 @@ def serve_http(
 
     global DATABASE_MANAGER, _HTTP_SERVER_STARTED
     _validate_http_address(host, port)
+    _require_http_bind_token(host)
     if _HTTP_SERVER_STARTED:
         raise RuntimeError("the Nexus HTTP MCP server is already running")
 
@@ -457,27 +517,32 @@ def serve_http(
 
     try:
         _unset_empty_environment_variables()
+        ensure_inbox_dir()
         if database:
             DATABASE_MANAGER.schedule_startup_open(database)
-        mcp.serve(host, port, path_prefix=path_prefix)
+        from ida_mcp.http import IdaMcpHttpRequestHandler
+
+        mcp.serve(
+            host,
+            port,
+            path_prefix=path_prefix,
+            request_handler=IdaMcpHttpRequestHandler,
+        )
     except Exception:
         if DATABASE_MANAGER is not previous_manager:
             DATABASE_MANAGER.shutdown()
             DATABASE_MANAGER = previous_manager
+        mcp.stop()
+        clear_http_bind()
         raise
 
     previous_manager.shutdown()
     _HTTP_SERVER_STARTED = True
+    set_http_bind(host, port, mcp.path_prefix)
     _start_mcp_trace(
         f"http://{host}:{port}{mcp.path_prefix}/mcp",
         agent,
     )
-    if not _is_loopback_host(host):
-        print(
-            "WARNING: MCP HTTP transport is bound to a non-loopback host without "
-            "built-in authentication; execute_python may be reachable over the network.",
-            file=sys.stderr,
-        )
     if background:
         return
 
@@ -508,6 +573,7 @@ def stop_http_server() -> None:
     if not _HTTP_SERVER_STARTED:
         return
     _HTTP_SERVER_STARTED = False
+    clear_http_bind()
     mcp.stop()
     _shutdown_server_state()
 
@@ -568,7 +634,7 @@ def _register_tool(func: Callable[P, R], metadata: ToolMetadata) -> Callable[P, 
             call_id=call_id,
             tool=name,
             session=session,
-            input=dict(arguments.arguments),
+            input=_trace_tool_input(arguments.arguments),
         )
         return name, call_id, session, time.monotonic()
 
@@ -947,6 +1013,73 @@ def close_database(
     return DATABASE_MANAGER.close_database(instance_id)
 
 
+@tool(title="Show sample upload HTTP API", read_only=True)
+def upload_info() -> UploadInfoResult:
+    """Return the absolute HTTP URL for uploading a sample.
+
+    Agents and curl do not have browser same-origin. If IDA_MCP_WEBDAV_URL is
+    set, url is that collection and method is PUT (WebDAV on another machine;
+    confirm_upload GETs only that prefix into the local inbox). Otherwise url
+    is built from this MCP request (Host, X-Forwarded-Proto, X-Forwarded-Host,
+    Forwarded) or IDA_MCP_PUBLIC_URL. Recommended flow: upload_info -> curl
+    -> confirm_upload -> open_database(path). Do not send file bytes through
+    MCP. Never returns credentials. Local stdio agents should pass a
+    filesystem path on this machine to open_database instead.
+    """
+
+    return http_upload_info()
+
+
+@tool(title="Confirm uploaded sample")
+def confirm_upload(
+    upload_id: Annotated[
+        str,
+        "upload_id from POST /uploads, or the filename PUT under IDA_MCP_WEBDAV_URL.",
+    ],
+    sha256: Annotated[
+        str | None,
+        "Optional SHA-256 hex digest to verify the stored sample.",
+    ] = None,
+) -> UploadFinishResult:
+    """Tell the server a curl/HTTP or WebDAV upload finished and return its local path.
+
+    Recommended flow: upload_info -> curl -> confirm_upload -> open_database(path).
+    For a remote WebDAV drop zone this GETs {IDA_MCP_WEBDAV_URL}/{filename} into
+    the inbox; it does not fetch arbitrary URLs. This tool does not call
+    open_database and does not accept file bytes.
+    """
+
+    return get_upload_store().confirm(upload_id, sha256)
+
+
+@tool(title="List inbox uploads", read_only=True)
+def list_uploads() -> ListUploadsResult:
+    """List pending and completed samples in the server inbox.
+
+    Recommended flow: upload_info -> POST /uploads -> confirm_upload ->
+    open_database(path). This tool does not call open_database.
+    """
+
+    return get_upload_store().list_uploads()
+
+
+@tool(title="Delete inbox upload")
+def delete_upload(
+    upload_id: Annotated[str, "Inbox upload identifier to delete."],
+) -> DeleteUploadResult:
+    """Delete one inbox upload. Paths outside the inbox are rejected.
+
+    Recommended flow: upload_info -> POST /uploads -> confirm_upload ->
+    open_database(path). This tool does not call open_database. If the sample is
+    held by a database lease, close_database first.
+    """
+
+    return get_upload_store().delete(
+        upload_id,
+        leased_paths=leased_database_paths(DATABASE_MANAGER),
+    )
+
+
 def _install_server_shutdown_handlers() -> None:
     def cleanup_and_exit(signum: int, _frame: Any) -> None:
         _shutdown_server_state()
@@ -1009,6 +1142,7 @@ def serve_stdio(
     previous_manager.shutdown()
 
     _unset_empty_environment_variables()
+    ensure_inbox_dir()
     _install_server_shutdown_handlers()
     _start_mcp_trace("stdio", agent)
     if database:
