@@ -23,7 +23,10 @@
         "IDA_MCP_INBOX": "${IDA_MCP_INBOX:-}",
         "IDA_MCP_UPLOAD_MAX_BYTES": "${IDA_MCP_UPLOAD_MAX_BYTES:-}",
         "IDA_MCP_TOKEN": "${IDA_MCP_TOKEN:-}",
-        "IDA_MCP_PUBLIC_URL": "${IDA_MCP_PUBLIC_URL:-}"
+        "IDA_MCP_PUBLIC_URL": "${IDA_MCP_PUBLIC_URL:-}",
+        "IDA_MCP_WEBDAV_URL": "${IDA_MCP_WEBDAV_URL:-}",
+        "IDA_MCP_WEBDAV_USER": "${IDA_MCP_WEBDAV_USER:-}",
+        "IDA_MCP_WEBDAV_PASSWORD": "${IDA_MCP_WEBDAV_PASSWORD:-}"
       }
     }
   },

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import socket
 import stat
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,6 +33,9 @@ def inbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.delenv(uploads_api.TOKEN_ENVIRONMENT_VARIABLE, raising=False)
     monkeypatch.delenv(uploads_api.UPLOAD_MAX_BYTES_ENVIRONMENT_VARIABLE, raising=False)
     monkeypatch.delenv(uploads_api.PUBLIC_URL_ENVIRONMENT_VARIABLE, raising=False)
+    monkeypatch.delenv(uploads_api.WEBDAV_URL_ENVIRONMENT_VARIABLE, raising=False)
+    monkeypatch.delenv(uploads_api.WEBDAV_USER_ENVIRONMENT_VARIABLE, raising=False)
+    monkeypatch.delenv(uploads_api.WEBDAV_PASSWORD_ENVIRONMENT_VARIABLE, raising=False)
     uploads_api.reset_upload_store()
     monkeypatch.setattr(
         mcp_api,
@@ -654,3 +660,200 @@ def test_upload_info_http_call_public_url_overrides_host(
         assert info["url"] == "https://forced.example/uploads"
     finally:
         mcp_api.stop_http_server()
+
+
+def _start_webdav(
+    objects: dict[str, bytes],
+    *,
+    user: str | None = None,
+    password: str = "",
+    oversize_path: str | None = None,
+) -> tuple[str, ThreadingHTTPServer]:
+    port = _free_port()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if user is not None:
+                token = base64.b64encode(f"{user}:{password}".encode()).decode()
+                if self.headers.get("Authorization") != f"Basic {token}":
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+            if self.path.endswith("/redirect"):
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:1/stolen")
+                self.end_headers()
+                return
+            if oversize_path is not None and self.path == oversize_path:
+                self.send_response(200)
+                self.send_header("Content-Length", "9")
+                self.end_headers()
+                self.wfile.write(b"012345678")
+                return
+            payload = objects.get(self.path)
+            if payload is None:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return f"http://127.0.0.1:{port}", server
+
+
+def test_webdav_object_url_stays_under_configured_prefix(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        uploads_api.WEBDAV_URL_ENVIRONMENT_VARIABLE,
+        "https://dav.example.com/ida-inbox/",
+    )
+    assert (
+        uploads_api.webdav_object_url("sample.elf")
+        == "https://dav.example.com/ida-inbox/sample.elf"
+    )
+    assert (
+        uploads_api.webdav_object_url("../etc/passwd")
+        == "https://dav.example.com/ida-inbox/passwd"
+    )
+    with pytest.raises(ValueError, match="filename, not a URL"):
+        uploads_api.webdav_object_url("https://evil.example/sample.elf")
+    with pytest.raises(ValueError, match="filename, not a URL"):
+        uploads_api.webdav_object_url("//evil.example/sample.elf")
+
+
+def test_upload_info_advertises_webdav_put_without_secrets(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        uploads_api.WEBDAV_URL_ENVIRONMENT_VARIABLE,
+        "https://dav.example.com/ida-inbox",
+    )
+    monkeypatch.setenv(uploads_api.WEBDAV_USER_ENVIRONMENT_VARIABLE, "dav-user")
+    monkeypatch.setenv(uploads_api.WEBDAV_PASSWORD_ENVIRONMENT_VARIABLE, "dav-secret")
+    info = mcp_api.upload_info()
+    dumped = json.dumps(info)
+    assert info["available"] is True
+    assert info["method"] == "PUT"
+    assert info["url"] == "https://dav.example.com/ida-inbox"
+    assert info["path"] == "/ida-inbox"
+    assert info["auth_required"] is True
+    assert "-T sample.bin" in info["curl"]
+    assert "$IDA_MCP_WEBDAV_PASSWORD" in info["curl"]
+    assert "dav-secret" not in dumped
+    assert "dav-user" not in dumped
+
+
+def test_confirm_upload_pulls_webdav_object_into_inbox(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"MZ-from-dav"
+    origin, server = _start_webdav({"/ida-inbox/sample.elf": payload})
+    monkeypatch.setenv(
+        uploads_api.WEBDAV_URL_ENVIRONMENT_VARIABLE, f"{origin}/ida-inbox"
+    )
+    try:
+        confirmed = mcp_api.confirm_upload("sample.elf")
+        path = Path(confirmed["path"])
+        assert path.resolve().is_relative_to(inbox.resolve())
+        assert path.name == "sample.elf"
+        assert path.read_bytes() == payload
+        assert confirmed["size"] == len(payload)
+        assert confirmed["sha256"] == _sha256(payload)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_confirm_upload_rejects_webdav_url_and_redirect(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    origin, server = _start_webdav({})
+    monkeypatch.setenv(
+        uploads_api.WEBDAV_URL_ENVIRONMENT_VARIABLE, f"{origin}/ida-inbox"
+    )
+    try:
+        with pytest.raises(McpToolError, match="filename, not a URL"):
+            mcp_api.confirm_upload("https://evil.example/sample.elf")
+        with pytest.raises(McpToolError, match="redirect"):
+            mcp_api.confirm_upload("redirect")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_confirm_upload_webdav_enforces_size_and_sha256(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    origin, server = _start_webdav(
+        {},
+        oversize_path="/ida-inbox/too-big.bin",
+    )
+    monkeypatch.setenv(
+        uploads_api.WEBDAV_URL_ENVIRONMENT_VARIABLE, f"{origin}/ida-inbox"
+    )
+    monkeypatch.setenv(uploads_api.UPLOAD_MAX_BYTES_ENVIRONMENT_VARIABLE, "8")
+    try:
+        with pytest.raises(McpToolError, match="exceeds limit"):
+            mcp_api.confirm_upload("too-big.bin")
+        origin2, server2 = _start_webdav({"/ida-inbox/sample.bin": b"abc"})
+        monkeypatch.setenv(
+            uploads_api.WEBDAV_URL_ENVIRONMENT_VARIABLE, f"{origin2}/ida-inbox"
+        )
+        try:
+            with pytest.raises(McpToolError, match="sha256 mismatch"):
+                mcp_api.confirm_upload("sample.bin", "0" * 64)
+        finally:
+            server2.shutdown()
+            server2.server_close()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_confirm_upload_prefers_local_inbox_over_webdav(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stored = UploadStore(inbox).store_bytes("local.bin", b"local-bytes")
+    origin, server = _start_webdav({f"/ida-inbox/{stored['upload_id']}": b"from-dav"})
+    monkeypatch.setenv(
+        uploads_api.WEBDAV_URL_ENVIRONMENT_VARIABLE, f"{origin}/ida-inbox"
+    )
+    try:
+        confirmed = mcp_api.confirm_upload(stored["upload_id"])
+        assert Path(confirmed["path"]).read_bytes() == b"local-bytes"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_webdav_get_sends_basic_auth(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"auth-ok"
+    origin, server = _start_webdav(
+        {"/ida-inbox/held.bin": payload},
+        user="dav-user",
+        password="dav-secret",
+    )
+    monkeypatch.setenv(
+        uploads_api.WEBDAV_URL_ENVIRONMENT_VARIABLE, f"{origin}/ida-inbox"
+    )
+    monkeypatch.setenv(uploads_api.WEBDAV_USER_ENVIRONMENT_VARIABLE, "dav-user")
+    monkeypatch.setenv(uploads_api.WEBDAV_PASSWORD_ENVIRONMENT_VARIABLE, "dav-secret")
+    try:
+        confirmed = mcp_api.confirm_upload("held.bin")
+        assert Path(confirmed["path"]).read_bytes() == payload
+        monkeypatch.setenv(uploads_api.WEBDAV_PASSWORD_ENVIRONMENT_VARIABLE, "wrong")
+        with pytest.raises(McpToolError, match="authentication failed"):
+            mcp_api.confirm_upload("held.bin")
+    finally:
+        server.shutdown()
+        server.server_close()

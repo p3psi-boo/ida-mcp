@@ -61,6 +61,9 @@ from ida_mcp.uploads import (
     PUBLIC_URL_ENVIRONMENT_VARIABLE,
     TOKEN_ENVIRONMENT_VARIABLE,
     UPLOAD_MAX_BYTES_ENVIRONMENT_VARIABLE,
+    WEBDAV_PASSWORD_ENVIRONMENT_VARIABLE,
+    WEBDAV_URL_ENVIRONMENT_VARIABLE,
+    WEBDAV_USER_ENVIRONMENT_VARIABLE,
     DeleteUploadResult,
     ListUploadsResult,
     UploadFinishResult,
@@ -86,6 +89,9 @@ MCP_ENVIRONMENT_VARIABLES = (
     UPLOAD_MAX_BYTES_ENVIRONMENT_VARIABLE,
     PUBLIC_URL_ENVIRONMENT_VARIABLE,
     TOKEN_ENVIRONMENT_VARIABLE,
+    WEBDAV_URL_ENVIRONMENT_VARIABLE,
+    WEBDAV_USER_ENVIRONMENT_VARIABLE,
+    WEBDAV_PASSWORD_ENVIRONMENT_VARIABLE,
     MCP_IDLE_TIMEOUT_ENVIRONMENT_VARIABLE,
 )
 
@@ -150,9 +156,10 @@ MCP_SERVER_INSTRUCTIONS = (
     "decompile to pseudocode, disassemble (disasm), xrefs, symbols, strings, imports, "
     "types. Use instead of objdump, readelf, nm or strings when you need decompilation "
     "or cross-references. open_database(path) only opens a path on this MCP server. "
-    "Remote samples: call upload_info for the HTTP POST /uploads URL, upload with "
-    "curl, then confirm_upload(upload_id) and open_database(path). Do not send file "
-    "bytes through MCP tools."
+    "Remote samples: call upload_info for the upload URL, upload with curl, then "
+    "confirm_upload and open_database(path). Do not send file bytes through MCP "
+    "tools. If IDA_MCP_WEBDAV_URL is set, PUT to that collection; confirm_upload "
+    "pulls the object into this machine's inbox."
 )
 mcp = McpServer("ida", version=PACKAGE_VERSION, instructions=MCP_SERVER_INSTRUCTIONS)
 
@@ -1010,12 +1017,14 @@ def close_database(
 def upload_info() -> UploadInfoResult:
     """Return the absolute HTTP URL for uploading a sample.
 
-    Agents and curl do not have browser same-origin. url is built from this
-    MCP request (Host, X-Forwarded-Proto, X-Forwarded-Host, Forwarded) or
-    IDA_MCP_PUBLIC_URL behind a proxy. Recommended flow: upload_info -> POST
-    url -> confirm_upload(upload_id) -> open_database(path). Do not send file
-    bytes through MCP. Never returns the bearer token. Local stdio agents
-    should pass a filesystem path on this machine to open_database instead.
+    Agents and curl do not have browser same-origin. If IDA_MCP_WEBDAV_URL is
+    set, url is that collection and method is PUT (WebDAV on another machine;
+    confirm_upload GETs only that prefix into the local inbox). Otherwise url
+    is built from this MCP request (Host, X-Forwarded-Proto, X-Forwarded-Host,
+    Forwarded) or IDA_MCP_PUBLIC_URL. Recommended flow: upload_info -> curl
+    -> confirm_upload -> open_database(path). Do not send file bytes through
+    MCP. Never returns credentials. Local stdio agents should pass a
+    filesystem path on this machine to open_database instead.
     """
 
     return http_upload_info()
@@ -1025,18 +1034,19 @@ def upload_info() -> UploadInfoResult:
 def confirm_upload(
     upload_id: Annotated[
         str,
-        "upload_id from the POST /uploads JSON response.",
+        "upload_id from POST /uploads, or the filename PUT under IDA_MCP_WEBDAV_URL.",
     ],
     sha256: Annotated[
         str | None,
         "Optional SHA-256 hex digest to verify the stored sample.",
     ] = None,
 ) -> UploadFinishResult:
-    """Tell the server a curl/HTTP upload finished and return its local path.
+    """Tell the server a curl/HTTP or WebDAV upload finished and return its local path.
 
-    Recommended flow: upload_info -> POST /uploads -> confirm_upload ->
-    open_database(path). This tool does not call open_database and does not
-    accept file bytes.
+    Recommended flow: upload_info -> curl -> confirm_upload -> open_database(path).
+    For a remote WebDAV drop zone this GETs {IDA_MCP_WEBDAV_URL}/{filename} into
+    the inbox; it does not fetch arbitrary URLs. This tool does not call
+    open_database and does not accept file bytes.
     """
 
     return get_upload_store().confirm(upload_id, sha256)

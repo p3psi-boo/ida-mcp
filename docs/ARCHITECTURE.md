@@ -56,10 +56,12 @@ open a database and never accept file bytes:
 
 `open_database` still requires a path on the MCP server. Stdio agents on the
 same machine pass a local path. Remote Streamable HTTP agents call
-`upload_info`, which returns an absolute `POST /uploads` URL derived from
-`IDA_MCP_PUBLIC_URL` or the current request's `Host` / `X-Forwarded-*`
-headers (not from a wildcard bind address), then curl, `confirm_upload`, and
-`open_database(path)`. Samples are stored at
+`upload_info`, which returns an absolute upload URL: either a `PUT`
+collection from `IDA_MCP_WEBDAV_URL` (another machine; `confirm_upload`
+GETs only that prefix into the local inbox) or a `POST /uploads` URL
+derived from `IDA_MCP_PUBLIC_URL` or the current request's `Host` /
+`X-Forwarded-*` headers (not from a wildcard bind address). Then curl,
+`confirm_upload`, and `open_database(path)`. Samples are stored at
 `inbox/<upload_id>/<filename>`. The inbox is `IDA_MCP_INBOX`, or
 `<IDA_MCP_STATE_DIR>/inbox`, or `<IDAUSR>/mcp/inbox`. Projects are distinguished
 by those filesystem paths; there is no extra session model.

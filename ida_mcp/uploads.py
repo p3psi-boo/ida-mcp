@@ -7,7 +7,9 @@ absolute path can be passed to the existing open tool unchanged.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import http.client
 import json
 import os
 import posixpath
@@ -19,16 +21,20 @@ from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from pathlib import Path
 from typing import TypedDict
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 
 from ida_mcp.paths import get_mcp_inbox_dir
 
 TOKEN_ENVIRONMENT_VARIABLE = "IDA_MCP_TOKEN"
 UPLOAD_MAX_BYTES_ENVIRONMENT_VARIABLE = "IDA_MCP_UPLOAD_MAX_BYTES"
 PUBLIC_URL_ENVIRONMENT_VARIABLE = "IDA_MCP_PUBLIC_URL"
+WEBDAV_URL_ENVIRONMENT_VARIABLE = "IDA_MCP_WEBDAV_URL"
+WEBDAV_USER_ENVIRONMENT_VARIABLE = "IDA_MCP_WEBDAV_USER"
+WEBDAV_PASSWORD_ENVIRONMENT_VARIABLE = "IDA_MCP_WEBDAV_PASSWORD"
 
 MAX_CHUNK_BYTES = 1 * 1024 * 1024
 DEFAULT_UPLOAD_MAX_BYTES = 256 * 1024 * 1024
+WEBDAV_GET_TIMEOUT_SECONDS = 120
 DEFAULT_SAMPLE_FILENAME = "sample.bin"
 _UPLOAD_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
@@ -125,6 +131,113 @@ def get_upload_max_bytes() -> int:
     if value <= 0:
         raise ValueError(f"{UPLOAD_MAX_BYTES_ENVIRONMENT_VARIABLE} must be positive")
     return value
+
+
+def get_webdav_url() -> str | None:
+    """Return the configured WebDAV collection URL, or None when unset."""
+    raw = os.environ.get(WEBDAV_URL_ENVIRONMENT_VARIABLE)
+    if raw is None or not raw.strip():
+        return None
+    value = raw.strip().rstrip("/")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return value
+
+
+def _webdav_object_name(upload_id: str) -> str:
+    if not isinstance(upload_id, str) or not upload_id.strip():
+        raise ValueError("webdav object name must be a filename, not a URL")
+    raw = upload_id.strip()
+    if "://" in raw or raw.startswith("//") or "\\" in raw:
+        raise ValueError("webdav object name must be a filename, not a URL")
+    return sanitize_filename(raw)
+
+
+def webdav_object_url(name: str) -> str:
+    """Build GET/PUT URL under the configured collection; never a client URL."""
+    base = get_webdav_url()
+    if base is None:
+        raise ValueError(f"{WEBDAV_URL_ENVIRONMENT_VARIABLE} is not set")
+    filename = _webdav_object_name(name)
+    parts = urlsplit(base)
+    prefix = parts.path.rstrip("/")
+    path = f"{prefix}/{quote(filename, safe='.-_')}"
+    url = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+    built = urlsplit(url)
+    if built.scheme != parts.scheme or built.netloc != parts.netloc:
+        raise ValueError("webdav object URL escapes the configured base")
+    if prefix and not built.path.startswith(f"{prefix}/"):
+        raise ValueError("webdav object URL escapes the configured base")
+    return url
+
+
+def _webdav_headers() -> dict[str, str]:
+    user = os.environ.get(WEBDAV_USER_ENVIRONMENT_VARIABLE)
+    password = os.environ.get(WEBDAV_PASSWORD_ENVIRONMENT_VARIABLE)
+    name = user.strip() if user else ""
+    secret = password.strip() if password else ""
+    if not name:
+        return {}
+    token = base64.b64encode(f"{name}:{secret}".encode()).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
+
+
+def _http_get_limited(url: str, headers: Mapping[str, str], max_bytes: int) -> bytes:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("webdav URL must be http or https")
+    path = parsed.path or "/"
+    connection: http.client.HTTPConnection
+    if parsed.scheme == "https":
+        connection = http.client.HTTPSConnection(
+            parsed.hostname,
+            parsed.port,
+            timeout=WEBDAV_GET_TIMEOUT_SECONDS,
+        )
+    else:
+        connection = http.client.HTTPConnection(
+            parsed.hostname,
+            parsed.port,
+            timeout=WEBDAV_GET_TIMEOUT_SECONDS,
+        )
+    try:
+        connection.request("GET", path, headers=dict(headers))
+        response = connection.getresponse()
+        if response.status in {301, 302, 303, 307, 308}:
+            raise ValueError("webdav redirect is not allowed")
+        if response.status == 404:
+            raise ValueError("webdav object not found")
+        if response.status in {401, 403}:
+            raise ValueError("webdav authentication failed")
+        if response.status != 200:
+            raise ValueError(f"webdav GET failed with HTTP {response.status}")
+        length_header = response.getheader("Content-Length")
+        if length_header is not None:
+            try:
+                declared = int(length_header)
+            except ValueError:
+                declared = None
+            else:
+                if declared > max_bytes:
+                    raise ValueError(
+                        f"upload size {declared} exceeds limit of {max_bytes} bytes"
+                    )
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = response.read(MAX_CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(
+                    f"upload size {total} exceeds limit of {max_bytes} bytes"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        connection.close()
 
 
 def sanitize_filename(filename: str | None) -> str:
@@ -353,8 +466,37 @@ class UploadStore:
         upload_id: str,
         sha256: str | None = None,
     ) -> UploadFinishResult:
-        """Acknowledge a sample already stored by HTTP POST /uploads."""
-        return self.finish(upload_id, sha256)
+        """Acknowledge a local POST /uploads object, or pull from configured WebDAV."""
+        if isinstance(upload_id, str) and _UPLOAD_ID_PATTERN.fullmatch(upload_id):
+            parsed_id = str(uuid.UUID(upload_id))
+            if (self.inbox / parsed_id).is_dir():
+                return self.finish(parsed_id, sha256)
+            if get_webdav_url() is not None:
+                return self.import_webdav(parsed_id, sha256)
+            return self.finish(parsed_id, sha256)
+        if get_webdav_url() is not None:
+            return self.import_webdav(upload_id, sha256)
+        raise ValueError("upload_id must be a UUID4")
+
+    def import_webdav(
+        self,
+        name: str,
+        sha256: str | None = None,
+    ) -> UploadFinishResult:
+        """GET `{IDA_MCP_WEBDAV_URL}/{filename}` into the local inbox.
+
+        The name is a basename under the configured collection. Client-supplied
+        URLs are rejected so this cannot be used as an open proxy.
+        """
+        filename = _webdav_object_name(name)
+        url = webdav_object_url(filename)
+        payload = _http_get_limited(url, _webdav_headers(), get_upload_max_bytes())
+        stored = self.store_bytes(filename, payload, sha256)
+        return UploadFinishResult(
+            path=stored["path"],
+            size=stored["size"],
+            sha256=stored["sha256"],
+        )
 
     def store_bytes(
         self,
@@ -688,6 +830,9 @@ def http_upload_info() -> UploadInfoResult:
     """Describe the HTTP sample-upload API without exposing the bearer token."""
     auth_required = get_mcp_token() is not None
     max_bytes = get_upload_max_bytes()
+    webdav = get_webdav_url()
+    if webdav is not None:
+        return _webdav_upload_info(webdav, max_bytes)
     with _BIND_LOCK:
         bind = _HTTP_BIND
     if bind is None:
@@ -737,6 +882,36 @@ def http_upload_info() -> UploadInfoResult:
         url=url,
         path=path,
         method="POST",
+        auth_required=auth_required,
+        max_bytes=max_bytes,
+        multipart_field="file",
+        filename_header="X-Filename",
+        curl=curl,
+        hint=hint,
+    )
+
+
+def _webdav_upload_info(webdav: str, max_bytes: int) -> UploadInfoResult:
+    parsed = urlparse(webdav)
+    path = parsed.path or "/"
+    auth_required = bool(os.environ.get(WEBDAV_USER_ENVIRONMENT_VARIABLE, "").strip())
+    auth = (
+        ' -u "$IDA_MCP_WEBDAV_USER:$IDA_MCP_WEBDAV_PASSWORD"' if auth_required else ""
+    )
+    target = f"{webdav}/sample.bin"
+    curl = f"curl -fsS{auth} -T sample.bin {target}"
+    hint = (
+        "WebDAV is on another machine, so IDA cannot open that path. PUT the "
+        "sample to url/<filename> (curl -T), then confirm_upload(filename). "
+        "This process GETs only {IDA_MCP_WEBDAV_URL}/{filename} into the local "
+        "inbox; client-supplied URLs are rejected. Then open_database(path). "
+        "Never returns WebDAV credentials."
+    )
+    return UploadInfoResult(
+        available=True,
+        url=webdav,
+        path=path,
+        method="PUT",
         auth_required=auth_required,
         max_bytes=max_bytes,
         multipart_field="file",

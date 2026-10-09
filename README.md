@@ -167,15 +167,20 @@ cannot infer `POST /uploads` from having reached `/mcp`. After a reverse proxy
 the process listen address (`0.0.0.0`, `127.0.0.1`) is also the wrong URL.
 `upload_info` therefore returns an **absolute** URL, in order:
 
-1. `IDA_MCP_PUBLIC_URL` if set (origin only, no `/uploads`)
-2. This MCP request's `X-Forwarded-Proto` / `X-Forwarded-Host` / `Forwarded` /
+1. `IDA_MCP_WEBDAV_URL` if set (a WebDAV collection on another host; method is `PUT`)
+2. `IDA_MCP_PUBLIC_URL` if set (origin only, no `/uploads`)
+3. This MCP request's `X-Forwarded-Proto` / `X-Forwarded-Host` / `Forwarded` /
    `Host`, plus `X-Forwarded-Prefix` or the server `--path-prefix` when the
    request was under that prefix
-3. The bind host only when it is a concrete address such as `127.0.0.1`
+4. The bind host only when it is a concrete address such as `127.0.0.1`
 
 A reverse proxy must forward the public host and scheme (`Host` or
 `X-Forwarded-Host`, and `X-Forwarded-Proto: https`). If it cannot, set
 `IDA_MCP_PUBLIC_URL=https://ida.example.com`.
+
+WebDAV on another machine is only a drop zone: IDA cannot open that path.
+`confirm_upload(filename)` GETs **only** `{IDA_MCP_WEBDAV_URL}/{filename}`
+into the local inbox. Arbitrary URLs from the agent are rejected.
 
 ```bash
 # Ask the MCP server for the URL, then:
@@ -188,6 +193,12 @@ curl -fsS -H "Authorization: Bearer $IDA_MCP_TOKEN" \
   -H "X-Filename: sample.elf" \
   --data-binary @sample.elf \
   http://127.0.0.1:8737/uploads
+
+# WebDAV on another host (IDA_MCP_WEBDAV_URL is the collection):
+curl -fsS -u "$IDA_MCP_WEBDAV_USER:$IDA_MCP_WEBDAV_PASSWORD" \
+  -T sample.elf \
+  "$IDA_MCP_WEBDAV_URL/sample.elf"
+# then confirm_upload("sample.elf")
 ```
 
 The JSON response includes `upload_id`, `path`, `size`, and `sha256`. Humans can
@@ -207,6 +218,9 @@ replace it.
 | `IDA_MCP_UPLOAD_MAX_BYTES` | Maximum sample size in bytes. Default: `268435456` (256 MiB). |
 | `IDA_MCP_TOKEN` | If set, Streamable HTTP MCP and `/uploads` require `Authorization: Bearer <token>`. Never logged or returned by tools. |
 | `IDA_MCP_PUBLIC_URL` | Optional public origin advertised by `upload_info` when Host / `X-Forwarded-*` would be wrong. Example: `https://ida.example.com`. |
+| `IDA_MCP_WEBDAV_URL` | Optional WebDAV collection on another host. When set, `upload_info` advertises `PUT` here and `confirm_upload(filename)` downloads `{url}/{filename}` into the inbox. Example: `https://dav.example.com/ida-inbox`. |
+| `IDA_MCP_WEBDAV_USER` | Basic-auth user for that collection. Never returned by tools. |
+| `IDA_MCP_WEBDAV_PASSWORD` | Basic-auth password for that collection. Never returned by tools. |
 | `IDA_MCP_STATE_DIR` | MCP state directory (sessions and, by default, the inbox). |
 
 Binding HTTP to anything other than `127.0.0.1` or `::1` without `IDA_MCP_TOKEN`
